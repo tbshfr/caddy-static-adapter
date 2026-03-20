@@ -1,0 +1,12 @@
+# Simple path redirects
+/home        /             301
+/about-us    /about        301
+
+# Wildcard redirect (splat)
+/blog/*      /posts/:splat 301
+
+# Placeholder redirect
+/user/:id    /profile/:id  302
+
+# External redirect
+/github      https://github.com  302

@@ -1,0 +1,281 @@
+package staticadapter
+
+import (
+	"os"
+	"path/filepath"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
+	"github.com/fsnotify/fsnotify"
+	"go.uber.org/zap"
+)
+
+// checkInterval is the fallback polling interval used when filesystem
+// notifications are unavailable.
+const checkInterval = 2 * time.Second
+
+// debounceDelay is the time to wait after the last fsnotify event before
+// reloading. This avoids reacting to intermediate file states during saves
+// (e.g., editors that truncate then write, producing a brief empty file).
+const debounceDelay = 100 * time.Millisecond
+
+// fileHandler provides shared file-watching, caching, and reload
+// infrastructure for handlers that monitor a configuration file on disk.
+// Both the headers and redirects handlers embed this type to avoid
+// duplicating the polling / fsnotify / caching logic.
+type fileHandler struct {
+	// Strict controls whether parse errors cause the handler to
+	// discard all rules. When false (default), parse warnings are
+	// logged but valid rules still apply.
+	Strict bool `json:"strict,omitempty"`
+
+	// MaxRules is the maximum number of rules allowed.
+	MaxRules int `json:"max_rules,omitempty"`
+
+	// MaxFileSize is the maximum file size in bytes (default: 1 MB).
+	MaxFileSize int `json:"max_file_size,omitempty"`
+
+	// MaxLineLength is the maximum number of characters allowed per line.
+	MaxLineLength int `json:"max_line_length,omitempty"`
+
+	mu           sync.RWMutex
+	cached       any // handler-specific compiled data (e.g. *Compiled or []*compiledRedirect)
+	resolvedPath string
+	lastModTime  time.Time
+	lastCheck    time.Time
+	logger       *zap.Logger
+	logPrefix    string // e.g. "static_headers" or "static_redirects"
+	fileName     string // basename to watch, e.g. "_headers" or "_redirects"
+
+	// Filesystem watcher fields.
+	watcher    *fsnotify.Watcher
+	watchedDir string
+	stopWatch  chan struct{}
+
+	// loadFn is called under write lock to load and compile the file.
+	// It must return the handler-specific compiled data or nil on failure.
+	loadFn func(filePath string) any
+}
+
+// getCached returns the cached compiled data for the given file path,
+// reloading from disk when the file has changed. The filesystem watcher
+// proactively reloads in the background; time-based polling acts as a
+// fallback when the watcher is unavailable.
+func (fh *fileHandler) getCached(filePath string) any {
+	now := time.Now()
+
+	// Fast path: read lock — serves the vast majority of requests.
+	fh.mu.RLock()
+	if fh.resolvedPath == filePath && now.Sub(fh.lastCheck) < checkInterval {
+		c := fh.cached
+		fh.mu.RUnlock()
+		return c
+	}
+	fh.mu.RUnlock()
+
+	// Slow path: write lock for potential reload.
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+
+	// Double-check after acquiring write lock.
+	if fh.resolvedPath == filePath && now.Sub(fh.lastCheck) < checkInterval {
+		return fh.cached
+	}
+
+	pathChanged := fh.resolvedPath != filePath
+	fh.lastCheck = now
+	fh.resolvedPath = filePath
+
+	info, err := os.Stat(filePath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fh.logger.Warn(fh.logPrefix+": failed to stat file",
+				zap.String("file", filePath),
+				zap.Error(err))
+		}
+		fh.cached = nil
+		fh.ensureWatchingLocked(filepath.Dir(filePath))
+		return nil
+	}
+
+	if !pathChanged && fh.cached != nil && info.ModTime().Equal(fh.lastModTime) {
+		fh.ensureWatchingLocked(filepath.Dir(filePath))
+		return fh.cached
+	}
+
+	fh.lastModTime = info.ModTime()
+	fh.cached = fh.loadFn(filePath)
+	fh.ensureWatchingLocked(filepath.Dir(filePath))
+	return fh.cached
+}
+
+// ensureWatchingLocked sets up a filesystem watcher for the given directory
+// so that changes to the watched file are detected instantly. Falls back to
+// polling if the watcher cannot be created. Must be called with fh.mu held
+// for writing.
+func (fh *fileHandler) ensureWatchingLocked(dir string) {
+	if fh.watchedDir == dir && fh.watcher != nil {
+		return
+	}
+
+	// Close any existing watcher.
+	fh.closeWatcherLocked()
+
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		fh.logger.Warn(fh.logPrefix+": failed to create file watcher, falling back to polling",
+			zap.Error(err))
+		return
+	}
+
+	if err := watcher.Add(dir); err != nil {
+		fh.logger.Warn(fh.logPrefix+": failed to watch directory, falling back to polling",
+			zap.String("dir", dir),
+			zap.Error(err))
+		watcher.Close()
+		return
+	}
+
+	fh.watcher = watcher
+	fh.watchedDir = dir
+	fh.stopWatch = make(chan struct{})
+	go fh.watchLoop(watcher, fh.stopWatch)
+}
+
+// watchLoop listens for filesystem events and proactively reloads the
+// compiled rules when the watched file changes, so updates take effect even
+// before the next request arrives. Events are debounced so that rapid
+// sequences (e.g., truncate + write) coalesce into a single reload.
+// It exits when stop is closed or the watcher is shut down.
+func (fh *fileHandler) watchLoop(watcher *fsnotify.Watcher, stop chan struct{}) {
+	var debounce *time.Timer
+	stopDebounce := func() {
+		if debounce != nil {
+			debounce.Stop()
+			debounce = nil
+		}
+	}
+	defer stopDebounce()
+
+	for {
+		select {
+		case <-stop:
+			return
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			if filepath.Base(event.Name) == fh.fileName &&
+				event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0 {
+				stopDebounce()
+				debounce = time.AfterFunc(debounceDelay, fh.reloadInBackground)
+			}
+		case err, ok := <-watcher.Errors:
+			if !ok {
+				return
+			}
+			fh.logger.Warn(fh.logPrefix+": file watcher error", zap.Error(err))
+		}
+	}
+}
+
+// reloadInBackground proactively reloads the watched file when a
+// filesystem event is detected, so compiled rules are up-to-date
+// before the next request arrives.
+func (fh *fileHandler) reloadInBackground() {
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+
+	if fh.resolvedPath == "" {
+		return
+	}
+
+	fh.lastCheck = time.Now()
+
+	info, err := os.Stat(fh.resolvedPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			fh.logger.Warn(fh.logPrefix+": failed to stat file",
+				zap.String("file", fh.resolvedPath),
+				zap.Error(err))
+		}
+		fh.cached = nil
+		return
+	}
+
+	fh.lastModTime = info.ModTime()
+	fh.cached = fh.loadFn(fh.resolvedPath)
+}
+
+// closeWatcherLocked shuts down the current filesystem watcher.
+// Must be called with fh.mu held for writing.
+func (fh *fileHandler) closeWatcherLocked() {
+	if fh.stopWatch != nil {
+		close(fh.stopWatch)
+		fh.stopWatch = nil
+	}
+	if fh.watcher != nil {
+		fh.watcher.Close()
+		fh.watcher = nil
+	}
+	fh.watchedDir = ""
+}
+
+// Cleanup releases resources held by the file handler.
+func (fh *fileHandler) Cleanup() error {
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+	fh.closeWatcherLocked()
+	return nil
+}
+
+// unmarshalCaddyfile parses the shared Caddyfile options (strict,
+// max_rules, max_file_size, max_line_length) that are common to
+// both the headers and redirects handlers.
+func (fh *fileHandler) unmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	d.Next() // consume directive name
+
+	for d.NextBlock(0) {
+		switch d.Val() {
+		case "strict":
+			fh.Strict = true
+		case "max_rules":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			val, err := strconv.Atoi(d.Val())
+			if err != nil {
+				return d.Errf("invalid max_rules value: %v", err)
+			}
+			fh.MaxRules = val
+		case "max_file_size":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			val, err := strconv.Atoi(d.Val())
+			if err != nil {
+				return d.Errf("invalid max_file_size value: %v", err)
+			}
+			fh.MaxFileSize = val
+		case "max_line_length":
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			val, err := strconv.Atoi(d.Val())
+			if err != nil {
+				return d.Errf("invalid max_line_length value: %v", err)
+			}
+			fh.MaxLineLength = val
+		default:
+			return d.Errf("unrecognized option: %s", d.Val())
+		}
+	}
+
+	return nil
+}
+
+// Interface guard: fileHandler satisfies caddy.CleanerUpper.
+var _ caddy.CleanerUpper = (*fileHandler)(nil)

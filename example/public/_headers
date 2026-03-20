@@ -1,0 +1,13 @@
+# Security headers for all pages
+/*
+  X-Frame-Options: DENY
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+
+# Cache static assets aggressively
+/static/*
+  Cache-Control: public, max-age=31556952, immutable
+
+# Custom header with placeholder
+/greet/:name
+  X-Greeting: Hello, :name!

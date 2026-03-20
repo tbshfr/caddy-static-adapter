@@ -1,0 +1,18 @@
+:8080 {
+	root * ./example/public
+	file_server
+
+	static_headers {
+		strict
+		max_rules 100
+		max_file_size 1048576
+		max_line_length 2000
+	}
+
+	static_redirects {
+		strict
+		max_rules 2000
+		max_file_size 1048576
+		max_line_length 1000
+	}
+}

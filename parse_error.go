@@ -8,8 +8,9 @@ const MaxFileSize = 1 << 20
 
 // ParseError represents a parse error with line number context.
 type ParseError struct {
-	Line    int
-	Message string
+	Line      int
+	Message   string
+	NonStrict bool // when true, this warning never causes strict-mode failure
 }
 
 func (e *ParseError) Error() string {

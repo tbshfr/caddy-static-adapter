@@ -333,3 +333,31 @@ func TestServeHTTPBlocks_redirects(t *testing.T) {
 		}
 	}
 }
+
+func TestRedirectStrictModeIgnores404(t *testing.T) {
+	dir := t.TempDir()
+	// Mix valid redirects with an unsupported 404 rule.
+	content := "/old /new 301\n/* /404.html 404\n/foo /bar\n"
+	redirectsFile := filepath.Join(dir, "_redirects")
+	if err := os.WriteFile(redirectsFile, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := &RedirectHandler{}
+	h.logger = zap.NewNop()
+	h.logPrefix = "static_redirects"
+	h.fileName = "_redirects"
+	h.Strict = true
+	h.loadFn = h.loadRedirectFile
+	defer h.Cleanup()
+
+	// Strict mode should still load — 404 warnings are NonStrict.
+	rules := h.getCompiledRedirects(redirectsFile)
+	if rules == nil {
+		t.Fatal("expected compiled rules (404 should not fail strict mode)")
+	}
+	// Only the two valid redirect rules should be loaded.
+	if rules.totalRules() != 2 {
+		t.Fatalf("expected 2 rules, got %d", rules.totalRules())
+	}
+}

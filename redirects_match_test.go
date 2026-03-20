@@ -218,3 +218,38 @@ func TestRedirectCloudflareExample(t *testing.T) {
 		}
 	}
 }
+
+func TestRedirectMatch404RuleSkipped(t *testing.T) {
+	input := `/old /new 301
+/* /404.html 404
+`
+	rules, warnings := ParseRedirects(strings.NewReader(input), 0, 0, 0)
+	// The 404 rule should be skipped with a warning.
+	if len(warnings) != 1 {
+		t.Fatalf("expected 1 warning, got %d", len(warnings))
+	}
+	if len(rules) != 1 {
+		t.Fatalf("expected 1 rule (404 skipped), got %d", len(rules))
+	}
+
+	compiled := make([]*compiledRedirect, len(rules))
+	for i, r := range rules {
+		compiled[i] = &compiledRedirect{RedirectRule: r, pathPattern: r.From}
+	}
+	cr := compileRedirects(compiled)
+
+	// /old should still match the 301 redirect.
+	match := cr.MatchFirst("/old")
+	if match == nil {
+		t.Fatal("expected match for /old")
+	}
+	if match.Status != 301 {
+		t.Errorf("expected status 301 for /old, got %d", match.Status)
+	}
+
+	// /anything-else should have no match since 404 was skipped.
+	match = cr.MatchFirst("/anything-else")
+	if match != nil {
+		t.Error("expected no match for /anything-else (404 rule should be skipped)")
+	}
+}

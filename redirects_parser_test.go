@@ -132,11 +132,15 @@ func TestParseRedirectsPlaceholders(t *testing.T) {
 }
 
 func TestParseRedirectsInvalidStatusCode(t *testing.T) {
-	input := `/old /new 404
+	// Status 200 is Netlify's rewrite syntax, which is not supported.
+	input := `/old /new 200
 `
 	rules, warnings := ParseRedirects(strings.NewReader(input), 0, 0, 0)
 	if len(warnings) != 1 {
 		t.Fatalf("expected 1 warning, got %d", len(warnings))
+	}
+	if !strings.Contains(warnings[0].Error(), "unsupported redirect status code 200") {
+		t.Errorf("expected warning about unsupported status code 200, got: %s", warnings[0].Error())
 	}
 	if len(rules) != 0 {
 		t.Fatalf("expected 0 rules, got %d", len(rules))
@@ -254,6 +258,48 @@ func TestParseRedirectsEmptyFile(t *testing.T) {
 	}
 	if len(rules) != 0 {
 		t.Fatalf("expected 0 rules, got %d", len(rules))
+	}
+}
+
+func TestParseRedirects404Skipped(t *testing.T) {
+	input := `/* /404.html 404
+`
+	rules, warnings := ParseRedirects(strings.NewReader(input), 0, 0, 0)
+	if len(rules) != 0 {
+		t.Fatalf("expected 0 rules (404 should be skipped), got %d", len(rules))
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("expected 1 warning, got %d", len(warnings))
+	}
+	if !strings.Contains(warnings[0].Error(), "not supported") {
+		t.Errorf("expected warning about unsupported status, got: %s", warnings[0].Error())
+	}
+	// Must be NonStrict so it doesn't fail strict mode.
+	pe, ok := warnings[0].(*ParseError)
+	if !ok {
+		t.Fatalf("expected *ParseError, got %T", warnings[0])
+	}
+	if !pe.NonStrict {
+		t.Error("expected NonStrict to be true for 404 warning")
+	}
+}
+
+func TestParseRedirects410Skipped(t *testing.T) {
+	input := `/old-api/* /gone.html 410
+`
+	rules, warnings := ParseRedirects(strings.NewReader(input), 0, 0, 0)
+	if len(rules) != 0 {
+		t.Fatalf("expected 0 rules (410 should be skipped), got %d", len(rules))
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("expected 1 warning, got %d", len(warnings))
+	}
+	pe, ok := warnings[0].(*ParseError)
+	if !ok {
+		t.Fatalf("expected *ParseError, got %T", warnings[0])
+	}
+	if !pe.NonStrict {
+		t.Error("expected NonStrict to be true for 410 warning")
 	}
 }
 

@@ -178,6 +178,12 @@ func (h *RedirectHandler) loadRedirectFile(filePath string) any {
 	parsed, warnings := ParseRedirects(f, h.MaxRules, h.MaxFileSize, h.MaxLineLength)
 	for _, w := range warnings {
 		if h.Strict {
+			// NonStrict warnings (e.g. unsupported 404/410 rules) are
+			// always logged as warnings, never cause strict-mode failure.
+			if pe, ok := w.(*ParseError); ok && pe.NonStrict {
+				h.logger.Warn(h.logPrefix+": parse warning", zap.Error(w))
+				continue
+			}
 			h.logger.Error(h.logPrefix+": parse error (strict mode)", zap.Error(w))
 			return nil
 		}

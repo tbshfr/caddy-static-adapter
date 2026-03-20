@@ -20,7 +20,7 @@ const RedirectMaxLineLength = 1000
 type RedirectRule struct {
 	From   string
 	To     string
-	Status int // HTTP status code (301, 302, 303, 307, 308)
+	Status int // HTTP status code (301, 302, 303, 307, 308) or rewrite status (404, 410)
 	Line   int // line number where the rule was defined
 }
 
@@ -36,6 +36,14 @@ func validRedirectStatus(code int) bool {
 		return true
 	}
 	return false
+}
+
+// isUnsupportedRewriteStatus reports whether the status code is a
+// Netlify/Cloudflare Pages error page status (404, 410) that we
+// recognise but don't handle. These are silently skipped with a
+// warning and never cause strict-mode failures.
+func isUnsupportedRewriteStatus(code int) bool {
+	return code == 404 || code == 410
 }
 
 // ParseRedirects reads a _redirects file from the given reader and returns
@@ -134,6 +142,12 @@ func parseRedirectLine(line string, lineNum int) (*RedirectRule, error) {
 			return nil, &ParseError{Line: lineNum, Message: fmt.Sprintf("invalid status code %q", fields[2])}
 		}
 		if !validRedirectStatus(code) {
+			if isUnsupportedRewriteStatus(code) {
+				// 404/410 error page rules are a Netlify/Cloudflare feature
+				// that is not supported — use Caddy's handle_errors instead.
+				// Skip silently (never fails strict mode).
+				return nil, &ParseError{Line: lineNum, Message: fmt.Sprintf("status code %d (custom error page) is not supported, use Caddy's handle_errors directive instead; rule skipped", code), NonStrict: true}
+			}
 			return nil, &ParseError{Line: lineNum, Message: fmt.Sprintf("unsupported redirect status code %d (must be 301, 302, 303, 307, or 308)", code)}
 		}
 		status = code

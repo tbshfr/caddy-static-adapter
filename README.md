@@ -196,6 +196,9 @@ static_redirects {
 ```bash
 xcaddy build --with github.com/tbshfr/caddy-static-adapter=./
 ```
+## Why does this exist? 
+
+I have some sites built with [Nuxt](https://nuxt.com/) - the [Netlify](https://nitro.build/deploy/providers/netlify) / [Cloudflare Pages](https://nitro.build/deploy/providers/cloudflare#cloudflare-pages) presets generate `_headers` and `_redirects` files with CSP ([nuxt-security](https://nuxt-security.vercel.app/)) and other headers automatically. This module makes it easy to host those static sites with Caddy and still use the auto generated headers and redirects.
 
 ## License
 

@@ -205,9 +205,9 @@ func TestMatchFirstMultipleWildcardsFirstMatchWins(t *testing.T) {
 func TestMatchFirstInterleavedMixedOrder(t *testing.T) {
 	// Complex interleaving: exact, wildcard, exact, wildcard
 	rules := []*compiledRedirect{
-		cr("/a", "/dest-a", 301),          // index 0 — exact
-		cr("/b/*", "/dest-b/:splat", 302), // index 1 — wildcard
-		cr("/c", "/dest-c", 301),          // index 2 — exact
+		cr("/a", "/dest-a", 301),           // index 0 — exact
+		cr("/b/*", "/dest-b/:splat", 302),  // index 1 — wildcard
+		cr("/c", "/dest-c", 301),           // index 2 — exact
 		cr("/a/*", "/dest-a2/:splat", 302), // index 3 — wildcard
 	}
 	compiled := compileRedirects(rules)
@@ -241,7 +241,7 @@ func TestMatchFirstPlaceholderBeforeExactWins(t *testing.T) {
 	// Placeholder rule (treated as wildcard) defined before exact should win
 	// when both match.
 	rules := []*compiledRedirect{
-		cr("/users/:id", "/profile/:id", 301), // index 0 — placeholder (wildcard bucket)
+		cr("/users/:id", "/profile/:id", 301),   // index 0 — placeholder (wildcard bucket)
 		cr("/users/admin", "/admin-panel", 302), // index 1 — exact
 	}
 	compiled := compileRedirects(rules)
@@ -285,9 +285,9 @@ func TestMatchFirstEarlyTermination(t *testing.T) {
 	// The exact match at index 0 should cause MatchFirst to not scan
 	// wildcards past index 0. This tests the early termination logic.
 	rules := []*compiledRedirect{
-		cr("/target", "/dest", 301),            // index 0 — exact
+		cr("/target", "/dest", 301),              // index 0 — exact
 		cr("/other/*", "/elsewhere/:splat", 302), // index 1 — wildcard (won't be reached for /target)
-		cr("/*", "/catchall/:splat", 302),      // index 2 — wildcard (won't be reached for /target)
+		cr("/*", "/catchall/:splat", 302),        // index 2 — wildcard (won't be reached for /target)
 	}
 	compiled := compileRedirects(rules)
 

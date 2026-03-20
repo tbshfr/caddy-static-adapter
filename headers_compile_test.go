@@ -455,16 +455,16 @@ func TestServeHTTPIntegration(t *testing.T) {
 		{
 			path: "/api/users",
 			want: map[string]string{
-				"X-Api-Version":              "v1",
+				"X-Api-Version":               "v1",
 				"Access-Control-Allow-Origin": "*",
 			},
 		},
 		{
 			path: "/api/private/secrets",
 			want: map[string]string{
-				"X-Api-Version":              "v1",
+				"X-Api-Version":               "v1",
 				"Access-Control-Allow-Origin": "*",
-				"X-Requires-Auth":            "true",
+				"X-Requires-Auth":             "true",
 			},
 		},
 		{

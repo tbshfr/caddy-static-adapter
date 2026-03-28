@@ -349,7 +349,7 @@ func TestCloudflareDuplicateHeaders(t *testing.T) {
 	ops := c.MatchOrdered("/static/styles.css", "")
 
 	headers := make(http.Header)
-	applyHeaders(headers, ops)
+	applyHeaders(headers, ops, false)
 
 	xRobots := headers.Get("X-Robots-Tag")
 	if xRobots != "nosnippet, noindex" {
@@ -370,7 +370,7 @@ func TestCloudflarePlaceholderExample(t *testing.T) {
 	ops := c.MatchOrdered("/movies/inception", "")
 
 	headers := make(http.Header)
-	applyHeaders(headers, ops)
+	applyHeaders(headers, ops, false)
 
 	val := headers.Get("X-Movie-Name")
 	if val != `You are watching "inception"` {
@@ -385,7 +385,7 @@ func TestApplyHeadersSet(t *testing.T) {
 	ops := []HeaderOp{
 		{Name: "X-Test", Value: "value1", Mode: OpSet},
 	}
-	applyHeaders(headers, ops)
+	applyHeaders(headers, ops, false)
 	if headers.Get("X-Test") != "value1" {
 		t.Errorf("expected value1, got %s", headers.Get("X-Test"))
 	}
@@ -397,7 +397,7 @@ func TestApplyHeadersDuplicate(t *testing.T) {
 		{Name: "X-Test", Value: "value1", Mode: OpSet},
 		{Name: "X-Test", Value: "value2", Mode: OpSet},
 	}
-	applyHeaders(headers, ops)
+	applyHeaders(headers, ops, false)
 	if headers.Get("X-Test") != "value1, value2" {
 		t.Errorf("expected 'value1, value2', got %s", headers.Get("X-Test"))
 	}
@@ -409,7 +409,7 @@ func TestApplyHeadersRemove(t *testing.T) {
 	ops := []HeaderOp{
 		{Name: "X-Test", Mode: OpRemove},
 	}
-	applyHeaders(headers, ops)
+	applyHeaders(headers, ops, false)
 	if headers.Get("X-Test") != "" {
 		t.Errorf("expected empty after remove, got %s", headers.Get("X-Test"))
 	}
@@ -421,9 +421,170 @@ func TestApplyHeadersSetThenRemove(t *testing.T) {
 		{Name: "Content-Security-Policy", Value: "default-src 'self';", Mode: OpSet},
 		{Name: "Content-Security-Policy", Mode: OpRemove},
 	}
-	applyHeaders(headers, ops)
+	applyHeaders(headers, ops, false)
 	if headers.Get("Content-Security-Policy") != "" {
 		t.Errorf("expected empty after set+remove, got %s", headers.Get("Content-Security-Policy"))
+	}
+}
+
+func TestApplyHeadersDedupOverwrites(t *testing.T) {
+	headers := make(http.Header)
+	ops := []HeaderOp{
+		{Name: "Cache-Control", Value: "public, max-age=31536000, immutable", Mode: OpSet},
+		{Name: "Cache-Control", Value: "public, max-age=1, immutable", Mode: OpSet},
+		{Name: "Cache-Control", Value: "public, max-age=31536000, immutable", Mode: OpSet},
+	}
+	applyHeaders(headers, ops, true)
+	want := "public, max-age=31536000, immutable"
+	if got := headers.Get("Cache-Control"); got != want {
+		t.Errorf("dedup: want %q, got %q", want, got)
+	}
+}
+
+func TestApplyHeadersDedupPreservesDistinct(t *testing.T) {
+	headers := make(http.Header)
+	ops := []HeaderOp{
+		{Name: "X-Frame-Options", Value: "DENY", Mode: OpSet},
+		{Name: "X-Content-Type-Options", Value: "nosniff", Mode: OpSet},
+	}
+	applyHeaders(headers, ops, true)
+	if got := headers.Get("X-Frame-Options"); got != "DENY" {
+		t.Errorf("want DENY, got %q", got)
+	}
+	if got := headers.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Errorf("want nosniff, got %q", got)
+	}
+}
+
+func TestApplyHeadersDedupRemoveStillWorks(t *testing.T) {
+	headers := make(http.Header)
+	ops := []HeaderOp{
+		{Name: "Cache-Control", Value: "public, max-age=31536000, immutable", Mode: OpSet},
+		{Name: "Cache-Control", Mode: OpRemove},
+		{Name: "Cache-Control", Value: "no-cache", Mode: OpSet},
+	}
+	applyHeaders(headers, ops, true)
+	if got := headers.Get("Cache-Control"); got != "no-cache" {
+		t.Errorf("dedup with remove: want %q, got %q", "no-cache", got)
+	}
+}
+
+func TestDedupIntegrationOverlappingWildcards(t *testing.T) {
+	input := `/_nuxt/builds/meta/*
+  Cache-Control: public, max-age=31536000, immutable
+/_nuxt/builds/*
+  Cache-Control: public, max-age=1, immutable
+/_nuxt/*
+  Cache-Control: public, max-age=31536000, immutable
+`
+	rules, warnings := Parse(strings.NewReader(input), 0, 0, 0)
+	if len(warnings) > 0 {
+		t.Fatalf("unexpected warnings: %v", warnings)
+	}
+	compiled := Compile(rules)
+
+	// Without dedup: all three values concatenated in file order
+	ops := compiled.MatchOrdered("/_nuxt/builds/meta/abc.json", "")
+	headers := make(http.Header)
+	applyHeaders(headers, ops, false)
+	got := headers.Get("Cache-Control")
+	if got != "public, max-age=31536000, immutable, public, max-age=1, immutable, public, max-age=31536000, immutable" {
+		t.Errorf("no-dedup: unexpected value %q", got)
+	}
+
+	// With dedup + specificity: most specific rule (/_nuxt/builds/meta/*) wins
+	ops = compiled.MatchBySpecificity("/_nuxt/builds/meta/abc.json", "")
+	headers = make(http.Header)
+	applyHeaders(headers, ops, true)
+	got = headers.Get("Cache-Control")
+	if got != "public, max-age=31536000, immutable" {
+		t.Errorf("dedup meta: want %q, got %q", "public, max-age=31536000, immutable", got)
+	}
+
+	// With dedup + specificity: /_nuxt/builds/* is more specific than /_nuxt/*
+	ops = compiled.MatchBySpecificity("/_nuxt/builds/latest.json", "")
+	headers = make(http.Header)
+	applyHeaders(headers, ops, true)
+	got = headers.Get("Cache-Control")
+	if got != "public, max-age=1, immutable" {
+		t.Errorf("dedup builds: want %q, got %q", "public, max-age=1, immutable", got)
+	}
+
+	// With dedup + specificity: only /_nuxt/* matches
+	ops = compiled.MatchBySpecificity("/_nuxt/some-chunk.js", "")
+	headers = make(http.Header)
+	applyHeaders(headers, ops, true)
+	got = headers.Get("Cache-Control")
+	if got != "public, max-age=31536000, immutable" {
+		t.Errorf("dedup nuxt: want %q, got %q", "public, max-age=31536000, immutable", got)
+	}
+}
+
+func TestDedupSpecificityExactBeatsWildcard(t *testing.T) {
+	input := `/*
+  X-Robots-Tag: noindex
+/about
+  X-Robots-Tag: index, follow
+`
+	rules, _ := Parse(strings.NewReader(input), 0, 0, 0)
+	compiled := Compile(rules)
+
+	ops := compiled.MatchBySpecificity("/about", "")
+	headers := make(http.Header)
+	applyHeaders(headers, ops, true)
+	got := headers.Get("X-Robots-Tag")
+	if got != "index, follow" {
+		t.Errorf("exact vs wildcard: want %q, got %q", "index, follow", got)
+	}
+}
+
+func TestDedupSpecificityEqualPreservesFileOrder(t *testing.T) {
+	// Two patterns with same prefix length before * — file order wins.
+	input := `/assets/*
+  Cache-Control: first
+/static/*
+  Cache-Control: second
+`
+	rules, _ := Parse(strings.NewReader(input), 0, 0, 0)
+	compiled := Compile(rules)
+
+	// /assets/foo only matches first rule
+	ops := compiled.MatchBySpecificity("/assets/foo", "")
+	headers := make(http.Header)
+	applyHeaders(headers, ops, true)
+	if got := headers.Get("Cache-Control"); got != "first" {
+		t.Errorf("assets: want %q, got %q", "first", got)
+	}
+
+	// /static/foo only matches second rule
+	ops = compiled.MatchBySpecificity("/static/foo", "")
+	headers = make(http.Header)
+	applyHeaders(headers, ops, true)
+	if got := headers.Get("Cache-Control"); got != "second" {
+		t.Errorf("static: want %q, got %q", "second", got)
+	}
+}
+
+func TestDedupSpecificityMultipleHeaders(t *testing.T) {
+	// More specific rule sets Cache-Control; broader rule sets X-Robots-Tag.
+	// Both should appear — dedup only overwrites same-name headers.
+	input := `/_nuxt/*
+  Cache-Control: public, max-age=31536000, immutable
+  X-Robots-Tag: noindex
+/_nuxt/builds/*
+  Cache-Control: public, max-age=1, immutable
+`
+	rules, _ := Parse(strings.NewReader(input), 0, 0, 0)
+	compiled := Compile(rules)
+
+	ops := compiled.MatchBySpecificity("/_nuxt/builds/latest.json", "")
+	headers := make(http.Header)
+	applyHeaders(headers, ops, true)
+	if got := headers.Get("Cache-Control"); got != "public, max-age=1, immutable" {
+		t.Errorf("Cache-Control: want %q, got %q", "public, max-age=1, immutable", got)
+	}
+	if got := headers.Get("X-Robots-Tag"); got != "noindex" {
+		t.Errorf("X-Robots-Tag: want %q, got %q", "noindex", got)
 	}
 }
 
@@ -485,7 +646,7 @@ func TestServeHTTPIntegration(t *testing.T) {
 		t.Run(tt.path, func(t *testing.T) {
 			rec := httptest.NewRecorder()
 			ops := compiled.MatchOrdered(tt.path, "")
-			applyHeaders(rec.Header(), ops)
+			applyHeaders(rec.Header(), ops, false)
 
 			for name, want := range tt.want {
 				got := rec.Header().Get(name)

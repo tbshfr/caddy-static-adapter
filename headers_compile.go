@@ -1,6 +1,7 @@
 package staticadapter
 
 import (
+	"math"
 	"sort"
 	"strings"
 )
@@ -15,6 +16,12 @@ type compiledRule struct {
 	placeholderTokens []string
 	needsSplat        bool
 	needsPlaceholders bool
+
+	// specificity measures how specific the pattern is. Higher values
+	// mean more specific. For exact matches this is math.MaxInt; for
+	// splat patterns it is the length of the prefix before the '*';
+	// for placeholder patterns it is the count of literal segments.
+	specificity int
 }
 
 // indexedRule pairs a compiledRule with its original position in the file,
@@ -80,6 +87,9 @@ func Compile(rules []*Rule) *Compiled {
 				}
 			}
 		}
+		// Compute specificity for dedup ordering.
+		cr.specificity = computeSpecificity(cr)
+
 		ir := indexedRule{index: i, cr: cr}
 
 		if hasWildcardOrPlaceholder(cr.pathPattern) {
@@ -142,6 +152,45 @@ func (c *Compiled) MatchOrdered(requestPath, requestHost string) []HeaderOp {
 	return ops
 }
 
+// MatchBySpecificity returns all header operations for matching rules, sorted
+// by pattern specificity (least specific first). When used with dedup "last
+// wins" semantics, the most specific matching rule's value takes precedence.
+// Rules with equal specificity preserve their original file order.
+func (c *Compiled) MatchBySpecificity(requestPath, requestHost string) []HeaderOp {
+	requestPath = normalizePath(requestPath)
+
+	// Collect all matching rules.
+	var matched []indexedRule
+
+	for _, ir := range c.exactPaths[requestPath] {
+		if ir.cr.host != "" && !matchHost(ir.cr.host, requestHost) {
+			continue
+		}
+		matched = append(matched, ir)
+	}
+
+	for _, ir := range c.wildcards {
+		if ir.cr.host != "" && !matchHost(ir.cr.host, requestHost) {
+			continue
+		}
+		if matchPattern(ir.cr.pathPattern, requestPath) {
+			matched = append(matched, ir)
+		}
+	}
+
+	// Stable sort by specificity ascending (least specific first).
+	// File order (index) is the tiebreaker via stable sort.
+	sort.SliceStable(matched, func(i, j int) bool {
+		return matched[i].cr.specificity < matched[j].cr.specificity
+	})
+
+	var ops []HeaderOp
+	for _, ir := range matched {
+		ops = append(ops, expandOps(ir.cr, requestPath)...)
+	}
+	return ops
+}
+
 // matchExactOnly returns ops from exact-match rules, checking host constraints.
 func matchExactOnly(rules []indexedRule, requestHost string) []HeaderOp {
 	var ops []HeaderOp
@@ -175,6 +224,28 @@ func (c *Compiled) totalRules() int {
 		total += len(rules)
 	}
 	return total
+}
+
+// computeSpecificity returns the specificity score for a compiled rule.
+// Exact matches get the highest score (math.MaxInt). Splat patterns
+// are scored by the length of the fixed prefix before the '*'. Placeholder
+// patterns are scored by the number of literal (non-placeholder) path segments.
+func computeSpecificity(cr *compiledRule) int {
+	if !cr.hasSplat && len(cr.placeholderTokens) == 0 {
+		// Exact match — highest specificity.
+		return math.MaxInt
+	}
+	if cr.hasSplat {
+		return strings.Index(cr.pathPattern, "*")
+	}
+	// Placeholder pattern: count literal segments.
+	count := 0
+	for _, part := range strings.Split(cr.pathPattern, "/") {
+		if part != "" && !strings.HasPrefix(part, ":") {
+			count++
+		}
+	}
+	return count
 }
 
 // expandOps expands placeholder references in header operation values.

@@ -67,8 +67,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		if h, _, err := net.SplitHostPort(host); err == nil {
 			host = h
 		}
-		ops := compiled.MatchOrdered(r.URL.Path, host)
-		applyHeaders(w.Header(), ops)
+		var ops []HeaderOp
+		if h.Dedup {
+			ops = compiled.MatchBySpecificity(r.URL.Path, host)
+		} else {
+			ops = compiled.MatchOrdered(r.URL.Path, host)
+		}
+		applyHeaders(w.Header(), ops, h.Dedup)
 	}
 
 	return next.ServeHTTP(w, r)
@@ -116,15 +121,24 @@ func (h *Handler) loadFile(filePath string) any {
 //   - Normal headers are set; if the same header appears multiple times,
 //     values are joined with a comma separator.
 //   - Headers prefixed with ! are removed.
-func applyHeaders(headers http.Header, ops []HeaderOp) {
+//
+// When dedup is true, duplicate header names across matching rules use
+// "last wins" semantics (overwrite) instead of comma-joining. This is
+// useful for _headers files with overlapping wildcard rules that set the
+// same header at different specificity levels.
+func applyHeaders(headers http.Header, ops []HeaderOp, dedup bool) {
 	for _, op := range ops {
 		switch op.Mode {
 		case OpSet:
-			existing := headers.Get(op.Name)
-			if existing == "" {
+			if dedup {
 				headers.Set(op.Name, op.Value)
 			} else {
-				headers.Set(op.Name, existing+", "+op.Value)
+				existing := headers.Get(op.Name)
+				if existing == "" {
+					headers.Set(op.Name, op.Value)
+				} else {
+					headers.Set(op.Name, existing+", "+op.Value)
+				}
 			}
 		case OpRemove:
 			headers.Del(op.Name)
@@ -138,6 +152,7 @@ func applyHeaders(headers http.Header, ops []HeaderOp) {
 //
 //	static_headers {
 //	    strict
+//	    dedup
 //	    max_rules <number>
 //	    max_file_size <size>
 //	    max_line_length <number>

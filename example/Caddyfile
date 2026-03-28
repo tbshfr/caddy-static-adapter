@@ -4,6 +4,7 @@
 
 	static_headers {
 		strict
+		dedup
 		max_rules 100
 		max_file_size 1048576
 		max_line_length 2000

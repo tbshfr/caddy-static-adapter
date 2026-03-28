@@ -142,11 +142,12 @@ If a file is missing, the handler just serves requests without applying any rule
 
 ### Caddyfile options
 
-Both `static_headers` and `static_redirects` accept the same options:
+`static_headers` and `static_redirects` accept the following options:
 
 ```caddyfile
 static_headers {
     strict
+    dedup
     max_rules 100
     max_file_size 1048576
     max_line_length 2000
@@ -165,6 +166,7 @@ static_redirects {
 | Option | Description |
 |---|---|
 | `strict` | Any parse warning discards **all** rules (default: log warnings, keep valid rules) |
+| `dedup` | When the same header is set by multiple matching rules, the most specific pattern wins instead of comma-joining (default: off). Rules are ordered from least to most specific, and the final (most specific) matching rule overwrites earlier ones. Longer wildcard prefixes and exact matches are considered more specific than broader patterns. Useful for `_headers` files with overlapping wildcard rules. Only applies to `static_headers`. |
 | `max_rules` | Max number of rules. Default: 100 for headers, 2000 for redirects |
 | `max_file_size` | Max file size in bytes (default: 1048576) |
 | `max_line_length` | Max characters per line. Default: 2000 for headers, 1000 for redirects |
@@ -175,6 +177,7 @@ static_redirects {
 {
   "handler": "static_headers",
   "strict": false,
+  "dedup": false,
   "max_rules": 100,
   "max_file_size": 1048576,
   "max_line_length": 2000

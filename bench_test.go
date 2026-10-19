@@ -2,6 +2,8 @@ package staticadapter
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -97,4 +99,22 @@ func BenchmarkRedirectsNoMatch500Unindexed(b *testing.B) {
 			b.Fatal("unexpected match")
 		}
 	}
+}
+
+func BenchmarkGetCachedParallel(b *testing.B) {
+	file := filepath.Join(b.TempDir(), "_headers")
+	if err := os.WriteFile(file, []byte(benchHeaders), 0644); err != nil {
+		b.Fatal(err)
+	}
+	h := newTestHeadersHandler()
+	defer h.Cleanup()
+	h.getCompiled(file)
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if h.getCompiled(file) == nil {
+				b.Fatal("expected rules")
+			}
+		}
+	})
 }

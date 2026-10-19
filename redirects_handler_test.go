@@ -221,9 +221,7 @@ func TestGetCompiledRedirectsReloadsViaWatcher(t *testing.T) {
 		t.Fatal("expected compiled redirect rules")
 	}
 
-	h.mu.RLock()
-	hasWatcher := h.watcher != nil
-	h.mu.RUnlock()
+	hasWatcher := h.hasWatcher()
 	if !hasWatcher {
 		t.Skip("fsnotify watcher not available on this platform; skipping watcher test")
 	}

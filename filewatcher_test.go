@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,21 +14,33 @@ import (
 
 // expireCache forces the next getCached call for every path to re-check the file.
 func (fh *fileHandler) expireCache() {
-	fh.mu.Lock()
-	defer fh.mu.Unlock()
-	for _, f := range fh.files {
-		f.lastCheck = time.Time{}
+	if files := fh.files.Load(); files != nil {
+		for _, f := range *files {
+			f.lastCheck.Store(0)
+		}
 	}
 }
 
 // cachedData returns the currently cached data for filePath without triggering a reload.
 func (fh *fileHandler) cachedData(filePath string) any {
-	fh.mu.RLock()
-	defer fh.mu.RUnlock()
-	if f := fh.files[filePath]; f != nil {
-		return f.data
+	if f := fh.lookup(filePath); f != nil {
+		return f.get()
 	}
 	return nil
+}
+
+// hasWatcher reports whether any cached file is watched by the shared watcher.
+func (fh *fileHandler) hasWatcher() bool {
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+	if files := fh.files.Load(); files != nil {
+		for _, f := range *files {
+			if f.watched {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func TestGetCachedMultipleRootsLoadOnce(t *testing.T) {
@@ -71,9 +84,7 @@ func TestGetCachedEvictsWhenFull(t *testing.T) {
 		h.getCached(filepath.Join(base, fmt.Sprint(i), "_redirects"))
 	}
 
-	h.mu.RLock()
-	n := len(h.files)
-	h.mu.RUnlock()
+	n := len(*h.files.Load())
 	if n != maxCachedFiles {
 		t.Errorf("expected cache to be capped at %d entries, got %d", maxCachedFiles, n)
 	}
@@ -94,9 +105,7 @@ func TestWatcherReloadsEachRoot(t *testing.T) {
 	h.getCached(fileA)
 	h.getCached(fileB)
 
-	h.mu.RLock()
-	hasWatcher := h.watcher != nil
-	h.mu.RUnlock()
+	hasWatcher := h.hasWatcher()
 	if !hasWatcher {
 		t.Skip("fsnotify watcher not available on this platform; skipping watcher test")
 	}
@@ -237,7 +246,7 @@ func (fh *fileHandler) pollOnce(file string, f *cachedFile) any {
 	fh.mu.Lock()
 	defer fh.mu.Unlock()
 	fh.refreshLocked(file, f, false)
-	return f.data
+	return f.get()
 }
 
 func TestPollingDetectsChangesWithPreservedMtime(t *testing.T) {
@@ -355,9 +364,7 @@ func TestWatcherFollowsReplacedRootDirectory(t *testing.T) {
 			h := newTestRedirectHandler()
 			defer h.Cleanup()
 			h.getCached(file)
-			h.mu.RLock()
-			hasWatcher := h.watcher != nil
-			h.mu.RUnlock()
+			hasWatcher := h.hasWatcher()
 			if !hasWatcher {
 				t.Skip("fsnotify watcher not available on this platform; skipping watcher test")
 			}
@@ -388,4 +395,177 @@ func TestWatcherFollowsReplacedRootDirectory(t *testing.T) {
 			t.Fatal("timed out: watcher did not pick up an edit in the new root directory")
 		})
 	}
+}
+
+// hubHandlers returns how many handlers the shared watcher notifies for dir.
+func hubHandlers(dir string) int {
+	sharedWatcher.mu.Lock()
+	defer sharedWatcher.mu.Unlock()
+	if d := sharedWatcher.dirs[dir]; d != nil {
+		return len(d.handlers)
+	}
+	return 0
+}
+
+func TestSharedWatcherAcrossHandlers(t *testing.T) {
+	dir := t.TempDir()
+	headersFile := filepath.Join(dir, "_headers")
+	redirectsFile := filepath.Join(dir, "_redirects")
+	if err := os.WriteFile(headersFile, []byte("/x\n  X-V: 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(redirectsFile, []byte("/x /v1 301\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	hh := newTestHeadersHandler()
+	rh := newTestRedirectHandler()
+	defer hh.Cleanup()
+	defer rh.Cleanup()
+	hh.getCompiled(headersFile)
+	rh.getCompiledRedirects(redirectsFile)
+	if !hh.hasWatcher() || !rh.hasWatcher() {
+		t.Skip("fsnotify watcher not available on this platform; skipping watcher test")
+	}
+
+	if n := hubHandlers(dir); n != 2 {
+		t.Fatalf("expected both handlers on one shared watch, got %d", n)
+	}
+
+	waitFor := func(what string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if cond() {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for %s", what)
+	}
+	headerValue := func() string {
+		c, _ := hh.cachedData(headersFile).(*Compiled)
+		if c == nil {
+			return ""
+		}
+		ops := c.MatchOrdered("/x", "")
+		if len(ops) != 1 {
+			return ""
+		}
+		return ops[0].Value
+	}
+	redirectTarget := func() string {
+		c, _ := rh.cachedData(redirectsFile).(*CompiledRedirects)
+		if c == nil || c.MatchFirst("/x") == nil {
+			return ""
+		}
+		return c.MatchFirst("/x").To
+	}
+
+	if err := os.WriteFile(headersFile, []byte("/x\n  X-V: 2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(redirectsFile, []byte("/x /v2 301\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor("headers reload", func() bool { return headerValue() == "2" })
+	waitFor("redirects reload", func() bool { return redirectTarget() == "/v2" })
+
+	// The remaining handler keeps getting events after the other is cleaned up.
+	hh.Cleanup()
+	if n := hubHandlers(dir); n != 1 {
+		t.Fatalf("expected 1 handler after cleanup, got %d", n)
+	}
+	if err := os.WriteFile(redirectsFile, []byte("/x /v3 301\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor("redirects reload after other handler's cleanup", func() bool { return redirectTarget() == "/v3" })
+
+	rh.Cleanup()
+	if n := hubHandlers(dir); n != 0 {
+		t.Fatalf("expected the watch to be removed after all cleanups, got %d handlers", n)
+	}
+}
+
+func TestDueCheckDoesNotBlockOtherRequests(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "_redirects")
+	writeWithMtime(t, file, "/x /v1 301\n", 0)
+
+	h := newTestRedirectHandler()
+	defer h.Cleanup()
+	h.getCompiledRedirects(file)
+
+	release := make(chan struct{})
+	loading := make(chan struct{})
+	load := h.loadFn
+	h.loadFn = func(p string) (any, error) {
+		close(loading)
+		<-release
+		return load(p)
+	}
+
+	writeWithMtime(t, file, "/x /v2 301\n", 10*time.Second)
+	h.expireCache()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.getCompiledRedirects(file) // wins the check and blocks in loadFn
+	}()
+	<-loading
+
+	served := make(chan string, 1)
+	go func() { served <- h.getCompiledRedirects(file).MatchFirst("/x").To }()
+	select {
+	case to := <-served:
+		if to != "/v1" {
+			t.Errorf("expected the current rules (/v1) during the reload, got %s", to)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("request blocked behind a reload in progress")
+	}
+
+	close(release)
+	<-done
+	if to := h.getCompiledRedirects(file).MatchFirst("/x").To; to != "/v2" {
+		t.Errorf("expected /v2 after the reload, got %s", to)
+	}
+}
+
+func TestGetCachedConcurrentWithReloads(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "_redirects")
+	writeWithMtime(t, file, "/x /v0 301\n", 0)
+
+	h := newTestRedirectHandler()
+	defer h.Cleanup()
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if c := h.getCompiledRedirects(file); c == nil || c.MatchFirst("/x") == nil {
+					t.Error("expected a rule for /x on every request")
+					return
+				}
+			}
+		}()
+	}
+
+	for i := 1; i <= 20; i++ {
+		writeWithMtime(t, file, fmt.Sprintf("/x /v%d 301\n", i), time.Duration(i)*time.Second)
+		h.expireCache()
+		h.reloadInBackground(file)
+		time.Sleep(5 * time.Millisecond)
+	}
+	close(stop)
+	wg.Wait()
 }

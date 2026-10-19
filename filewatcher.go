@@ -6,11 +6,11 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
-	"github.com/fsnotify/fsnotify"
 	"go.uber.org/zap"
 )
 
@@ -29,12 +29,30 @@ const debounceDelay = 100 * time.Millisecond
 const maxCachedFiles = 64
 
 // cachedFile holds the compiled data and reload state for one file path.
+// data and lastCheck are read without locking on every request; the other
+// fields are guarded by fileHandler.mu.
 type cachedFile struct {
-	data       any         // handler-specific compiled data (e.g. *Compiled or *CompiledRedirects)
-	loaded     os.FileInfo // file version data was loaded from; nil before the first successful load
-	lastCheck  time.Time
-	watchedDir os.FileInfo // directory the watch was added for; nil when not watched
-	lastErr    string      // last load error, so a persisting error is logged only once
+	data      atomic.Pointer[any] // handler-specific compiled data (e.g. *Compiled or *CompiledRedirects)
+	lastCheck atomic.Int64        // UnixNano of the last check
+
+	loaded  os.FileInfo // file version data was loaded from; nil before the first successful load
+	watched bool        // whether the file's directory is subscribed in sharedWatcher
+	lastErr string      // last load error, so a persisting error is logged only once
+}
+
+func (f *cachedFile) get() any {
+	if p := f.data.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+func (f *cachedFile) set(data any) {
+	if data == nil {
+		f.data.Store(nil)
+		return
+	}
+	f.data.Store(&data)
 }
 
 // fileHandler provides shared file-watching, caching, and reload
@@ -67,18 +85,22 @@ type fileHandler struct {
 	// Fix for https://github.com/nitrojs/nitro/pull/3938 until its merged
 	Dedup bool `json:"dedup,omitempty"`
 
-	mu        sync.RWMutex
-	files     map[string]*cachedFile // keyed by file path
+	// mu serializes checks and reloads. Requests never wait for it unless
+	// they are the first for a file path.
+	mu sync.Mutex
+	// files maps file paths to cache entries. The map is never modified;
+	// adding or evicting an entry stores a new map, under mu.
+	files atomic.Pointer[map[string]*cachedFile]
+
 	logger    *zap.Logger
 	logPrefix string // e.g. "static_headers" or "static_redirects"
 	fileName  string // basename to watch, e.g. "_headers" or "_redirects"
 
-	// Filesystem watcher fields. A single watcher covers the directories
-	// of all cached files.
-	watcher   *fsnotify.Watcher
-	stopWatch chan struct{}
+	debounceMu sync.Mutex
+	debounce   map[string]*time.Timer // pending watcher reloads by file path
+	closed     atomic.Bool            // set by Cleanup
 
-	// loadFn is called under write lock to load and compile the file.
+	// loadFn is called under mu to load and compile the file.
 	// It returns the handler-specific compiled data, or an error when the
 	// file could not be read or was rejected in strict mode.
 	loadFn func(filePath string) (any, error)
@@ -88,66 +110,85 @@ type fileHandler struct {
 // reloading from disk when the file has changed. The filesystem watcher
 // proactively reloads in the background; time-based polling acts as a
 // fallback when the watcher is unavailable.
+//
+// A cache hit takes no lock. When an entry is due for a check, the request
+// that wins the compare-and-swap on lastCheck performs it, while concurrent
+// requests keep serving the current rules instead of queueing behind it.
 func (fh *fileHandler) getCached(filePath string) any {
-	now := time.Now()
+	now := time.Now().UnixNano()
 
-	// Fast path: read lock — serves the vast majority of requests.
-	fh.mu.RLock()
-	if f := fh.files[filePath]; f != nil && now.Sub(f.lastCheck) < checkInterval {
-		data := f.data
-		fh.mu.RUnlock()
-		return data
+	if f := fh.lookup(filePath); f != nil {
+		last := f.lastCheck.Load()
+		if now-last >= int64(checkInterval) && f.lastCheck.CompareAndSwap(last, now) {
+			fh.mu.Lock()
+			fh.ensureWatchingLocked(filePath, f)
+			fh.refreshLocked(filePath, f, false)
+			fh.mu.Unlock()
+		}
+		return f.get()
 	}
-	fh.mu.RUnlock()
 
-	// Slow path: write lock for potential reload.
 	fh.mu.Lock()
 	defer fh.mu.Unlock()
 
-	// Double-check after acquiring write lock.
-	f := fh.files[filePath]
-	if f != nil && now.Sub(f.lastCheck) < checkInterval {
-		return f.data
-	}
-	if f == nil {
-		f = fh.addFileLocked(filePath)
+	// Another request may have added the entry while this one waited.
+	if f := fh.lookup(filePath); f != nil {
+		return f.get()
 	}
 
-	f.lastCheck = now
+	// Publish the entry only after its first load, so concurrent requests
+	// never see it without rules.
+	f := &cachedFile{}
+	f.lastCheck.Store(now)
 	fh.ensureWatchingLocked(filePath, f)
 	fh.refreshLocked(filePath, f, false)
-	return f.data
+	fh.addFileLocked(filePath, f)
+	return f.get()
 }
 
-// addFileLocked creates a cache entry for filePath, evicting the least
-// recently checked entry when the cache is full. Must be called with fh.mu
-// held for writing.
-func (fh *fileHandler) addFileLocked(filePath string) *cachedFile {
-	if fh.files == nil {
-		fh.files = make(map[string]*cachedFile)
+// lookup returns the cache entry for filePath, or nil.
+func (fh *fileHandler) lookup(filePath string) *cachedFile {
+	if files := fh.files.Load(); files != nil {
+		return (*files)[filePath]
 	}
-	if len(fh.files) >= maxCachedFiles {
-		var oldestPath string
-		var oldest *cachedFile
-		for p, f := range fh.files {
-			if oldest == nil || f.lastCheck.Before(oldest.lastCheck) {
-				oldestPath, oldest = p, f
-			}
-		}
-		if oldest.watchedDir != nil && fh.watcher != nil {
-			_ = fh.watcher.Remove(filepath.Dir(oldestPath))
-		}
-		delete(fh.files, oldestPath)
+	return nil
+}
+
+// addFileLocked publishes a cache entry for filePath, evicting the least
+// recently checked entry when the cache is full. Must be called with fh.mu
+// held.
+func (fh *fileHandler) addFileLocked(filePath string, f *cachedFile) {
+	var current map[string]*cachedFile
+	if files := fh.files.Load(); files != nil {
+		current = *files
 	}
 
-	f := &cachedFile{}
-	fh.files[filePath] = f
-	return f
+	next := make(map[string]*cachedFile, len(current)+1)
+	for p, e := range current {
+		next[p] = e
+	}
+	if len(next) >= maxCachedFiles {
+		var oldestPath string
+		var oldest *cachedFile
+		for p, e := range next {
+			if oldest == nil || e.lastCheck.Load() < oldest.lastCheck.Load() {
+				oldestPath, oldest = p, e
+			}
+		}
+		if oldest.watched {
+			sharedWatcher.unsubscribe(filepath.Dir(oldestPath), fh)
+			oldest.watched = false
+		}
+		delete(next, oldestPath)
+	}
+
+	next[filePath] = f
+	fh.files.Store(&next)
 }
 
 // refreshLocked stats filePath and reloads it when it changed since the
 // last successful load, or unconditionally when force is set. Must be
-// called with fh.mu held for writing.
+// called with fh.mu held.
 //
 // A failed load keeps the previously loaded rules, so a broken deploy does
 // not silently strip headers such as a CSP. Failures are retried on every
@@ -156,7 +197,7 @@ func (fh *fileHandler) addFileLocked(filePath string) *cachedFile {
 func (fh *fileHandler) refreshLocked(filePath string, f *cachedFile, force bool) {
 	info, err := os.Stat(filePath)
 	if os.IsNotExist(err) {
-		f.data = nil
+		f.set(nil)
 		f.lastErr = ""
 		return
 	}
@@ -165,7 +206,7 @@ func (fh *fileHandler) refreshLocked(filePath string, f *cachedFile, force bool)
 		return
 	}
 
-	if !force && f.data != nil && f.lastErr == "" && !fileChanged(f.loaded, info) {
+	if !force && f.get() != nil && f.lastErr == "" && !fileChanged(f.loaded, info) {
 		return
 	}
 
@@ -174,7 +215,7 @@ func (fh *fileHandler) refreshLocked(filePath string, f *cachedFile, force bool)
 		fh.logLoadErrorLocked(filePath, f, err)
 		return
 	}
-	f.data = data
+	f.set(data)
 	f.loaded = info
 	f.lastErr = ""
 }
@@ -192,7 +233,7 @@ func fileChanged(loaded, info os.FileInfo) bool {
 }
 
 // logLoadErrorLocked logs err unless it is the same error that was last
-// logged for this file. Must be called with fh.mu held for writing.
+// logged for this file. Must be called with fh.mu held.
 func (fh *fileHandler) logLoadErrorLocked(filePath string, f *cachedFile, err error) {
 	if err.Error() == f.lastErr {
 		return
@@ -200,131 +241,98 @@ func (fh *fileHandler) logLoadErrorLocked(filePath string, f *cachedFile, err er
 	f.lastErr = err.Error()
 	fh.logger.Error(fh.logPrefix+": failed to load file",
 		zap.String("file", filePath),
-		zap.Bool("keeping_previous_rules", f.data != nil),
+		zap.Bool("keeping_previous_rules", f.get() != nil),
 		zap.Error(err))
 }
 
-// ensureWatchingLocked adds the directory of filePath to the filesystem
-// watcher so that changes are detected instantly, creating the watcher on
-// first use. Falls back to polling if the watcher cannot be created or the
-// directory cannot be watched. Must be called with fh.mu held for writing.
-//
-// The watch follows the directory it was added for, not its path. When the
-// directory is replaced (a renamed release directory or a re-pointed
-// symlink, as common in deploys) the watch is moved to the new one.
+// ensureWatchingLocked subscribes the directory of filePath in the shared
+// filesystem watcher so that changes are detected instantly. Falls back to
+// polling if the directory cannot be watched. Called on every check, so a
+// replaced directory is re-watched. Must be called with fh.mu held.
 func (fh *fileHandler) ensureWatchingLocked(filePath string, f *cachedFile) {
-	dir := filepath.Dir(filePath)
-	dirInfo, err := os.Stat(dir)
-
-	if f.watchedDir != nil {
-		if err == nil && os.SameFile(f.watchedDir, dirInfo) {
-			return
-		}
-		_ = fh.watcher.Remove(dir)
-		f.watchedDir = nil
-	}
-	if err != nil {
-		return // directory missing; polling picks the file up once it appears
-	}
-
-	if fh.watcher == nil {
-		watcher, err := fsnotify.NewWatcher()
-		if err != nil {
-			fh.logger.Warn(fh.logPrefix+": failed to create file watcher, falling back to polling",
-				zap.Error(err))
-			return
-		}
-		fh.watcher = watcher
-		fh.stopWatch = make(chan struct{})
-		go fh.watchLoop(watcher, fh.stopWatch)
-	}
-
-	if err := fh.watcher.Add(dir); err != nil {
-		fh.logger.Warn(fh.logPrefix+": failed to watch directory, falling back to polling",
-			zap.String("dir", dir),
-			zap.Error(err))
+	if fh.closed.Load() {
 		return
 	}
-	f.watchedDir = dirInfo
+
+	dir := filepath.Dir(filePath)
+	if err := sharedWatcher.subscribe(dir, fh); err != nil {
+		f.watched = false
+		// A missing directory is picked up by polling once it appears.
+		if !os.IsNotExist(err) {
+			fh.logger.Warn(fh.logPrefix+": failed to watch directory, falling back to polling",
+				zap.String("dir", dir),
+				zap.Error(err))
+		}
+		return
+	}
+	f.watched = true
 }
 
-// watchLoop listens for filesystem events and proactively reloads the
-// compiled rules when a watched file changes, so updates take effect even
-// before the next request arrives. Events are debounced per file so that
-// rapid sequences (e.g., truncate + write) coalesce into a single reload.
-// It exits when stop is closed or the watcher is shut down.
-func (fh *fileHandler) watchLoop(watcher *fsnotify.Watcher, stop chan struct{}) {
-	debounce := make(map[string]*time.Timer)
-	defer func() {
-		for _, t := range debounce {
-			t.Stop()
-		}
-	}()
+// scheduleReload reloads filePath after debounceDelay, restarting the delay
+// when called again before it expires, so that rapid event sequences
+// (e.g., truncate + write) coalesce into a single reload.
+func (fh *fileHandler) scheduleReload(filePath string) {
+	fh.debounceMu.Lock()
+	defer fh.debounceMu.Unlock()
 
-	for {
-		select {
-		case <-stop:
-			return
-		case event, ok := <-watcher.Events:
-			if !ok {
-				return
-			}
-			if filepath.Base(event.Name) == fh.fileName &&
-				event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0 {
-				filePath := filepath.Clean(event.Name)
-				if t := debounce[filePath]; t != nil {
-					t.Stop()
-				}
-				debounce[filePath] = time.AfterFunc(debounceDelay, func() {
-					fh.reloadInBackground(filePath)
-				})
-			}
-		case err, ok := <-watcher.Errors:
-			if !ok {
-				return
-			}
-			fh.logger.Warn(fh.logPrefix+": file watcher error", zap.Error(err))
-		}
+	if fh.closed.Load() {
+		return
 	}
+	if t := fh.debounce[filePath]; t != nil {
+		t.Stop()
+	}
+	if fh.debounce == nil {
+		fh.debounce = make(map[string]*time.Timer)
+	}
+
+	var t *time.Timer
+	t = time.AfterFunc(debounceDelay, func() {
+		fh.debounceMu.Lock()
+		if fh.debounce[filePath] == t {
+			delete(fh.debounce, filePath)
+		}
+		fh.debounceMu.Unlock()
+		fh.reloadInBackground(filePath)
+	})
+	fh.debounce[filePath] = t
 }
 
 // reloadInBackground proactively reloads a watched file when a
 // filesystem event is detected, so compiled rules are up-to-date
 // before the next request arrives.
 func (fh *fileHandler) reloadInBackground(filePath string) {
-	fh.mu.Lock()
-	defer fh.mu.Unlock()
-
-	f := fh.files[filePath]
+	f := fh.lookup(filePath)
 	if f == nil {
 		return // evicted since the event was queued
 	}
 
-	f.lastCheck = time.Now()
+	fh.mu.Lock()
+	defer fh.mu.Unlock()
+	f.lastCheck.Store(time.Now().UnixNano())
 	fh.refreshLocked(filePath, f, true)
-}
-
-// closeWatcherLocked shuts down the current filesystem watcher.
-// Must be called with fh.mu held for writing.
-func (fh *fileHandler) closeWatcherLocked() {
-	if fh.stopWatch != nil {
-		close(fh.stopWatch)
-		fh.stopWatch = nil
-	}
-	if fh.watcher != nil {
-		fh.watcher.Close()
-		fh.watcher = nil
-	}
-	for _, f := range fh.files {
-		f.watchedDir = nil
-	}
 }
 
 // Cleanup releases resources held by the file handler.
 func (fh *fileHandler) Cleanup() error {
+	fh.closed.Store(true)
+
+	fh.debounceMu.Lock()
+	for _, t := range fh.debounce {
+		t.Stop()
+	}
+	fh.debounce = nil
+	fh.debounceMu.Unlock()
+
 	fh.mu.Lock()
 	defer fh.mu.Unlock()
-	fh.closeWatcherLocked()
+	if files := fh.files.Load(); files != nil {
+		for p, f := range *files {
+			if f.watched {
+				sharedWatcher.unsubscribe(filepath.Dir(p), fh)
+				f.watched = false
+			}
+		}
+	}
 	return nil
 }
 

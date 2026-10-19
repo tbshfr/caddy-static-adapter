@@ -213,9 +213,7 @@ func TestGetCompiledReloadsViaWatcher(t *testing.T) {
 		t.Fatal("expected compiled rules")
 	}
 
-	h.mu.RLock()
-	hasWatcher := h.watcher != nil
-	h.mu.RUnlock()
+	hasWatcher := h.hasWatcher()
 	if !hasWatcher {
 		t.Skip("fsnotify watcher not available on this platform; skipping watcher test")
 	}
@@ -259,9 +257,7 @@ func TestGetCompiledFileAppearsViaWatcher(t *testing.T) {
 		t.Fatal("expected nil for missing file")
 	}
 
-	h.mu.RLock()
-	hasWatcher := h.watcher != nil
-	h.mu.RUnlock()
+	hasWatcher := h.hasWatcher()
 	if !hasWatcher {
 		t.Skip("fsnotify watcher not available on this platform; skipping watcher test")
 	}
@@ -302,9 +298,7 @@ func TestWatcherProactiveReload(t *testing.T) {
 		t.Fatal("expected compiled rules")
 	}
 
-	h.mu.RLock()
-	hasWatcher := h.watcher != nil
-	h.mu.RUnlock()
+	hasWatcher := h.hasWatcher()
 	if !hasWatcher {
 		t.Skip("fsnotify watcher not available on this platform; skipping watcher test")
 	}
@@ -350,9 +344,7 @@ func TestWatcherDebounce(t *testing.T) {
 		t.Fatal("expected compiled rules")
 	}
 
-	h.mu.RLock()
-	hasWatcher := h.watcher != nil
-	h.mu.RUnlock()
+	hasWatcher := h.hasWatcher()
 	if !hasWatcher {
 		t.Skip("fsnotify watcher not available on this platform; skipping watcher test")
 	}

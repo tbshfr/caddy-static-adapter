@@ -133,6 +133,31 @@ func TestMatchAbsoluteURL(t *testing.T) {
 	}
 }
 
+func TestMatchAbsoluteURLHostPlaceholder(t *testing.T) {
+	rules, warnings := Parse(strings.NewReader("https://:sub.example.com/*\n  X-Robots-Tag: noindex\n"), 0, 0, 0)
+	if len(warnings) != 0 {
+		t.Fatalf("unexpected warnings: %v", warnings)
+	}
+	c := Compile(rules)
+
+	for _, dedup := range []bool{false, true} {
+		match := c.MatchOrdered
+		if dedup {
+			match = c.MatchBySpecificity
+		}
+
+		if ops := match("/home", "my-site.example.com"); len(ops) != 1 || ops[0].Value != "noindex" {
+			t.Errorf("dedup=%v: expected noindex on matching host, got %v", dedup, ops)
+		}
+		if ops := match("/home", "example.com"); len(ops) != 0 {
+			t.Errorf("dedup=%v: expected no ops on other host, got %v", dedup, ops)
+		}
+		if ops := match("/home", "a.b.example.com"); len(ops) != 0 {
+			t.Errorf("dedup=%v: placeholder must match a single label, got %v", dedup, ops)
+		}
+	}
+}
+
 func TestMatchSuffix(t *testing.T) {
 	rules := []*Rule{
 		{Pattern: "/*.jpg", Ops: []HeaderOp{

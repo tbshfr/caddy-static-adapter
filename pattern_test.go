@@ -36,12 +36,44 @@ func TestExtractPath(t *testing.T) {
 		{"https://example.com/", "/"},
 		{"https://example.com", "/"},
 		{"https://example.com/path/*", "/path/*"},
+		{"https://:sub.example.com/*", "/*"},
+		{"https://:sub.example.com/movies/:title", "/movies/:title"},
+		{"https://example.com:8443/path", "/path"},
+		{"https://example.com/path?query=1", "/path"},
+		{"https://example.com?query=1", "/"},
+		{"https://example.com/caf%C3%A9", "/café"},
 	}
 
 	for _, tt := range tests {
 		got := extractPath(tt.input)
 		if got != tt.want {
 			t.Errorf("extractPath(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
+// ---------- Extract Host Tests ----------
+
+func TestExtractHost(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"/foo/bar", ""},
+		{"https://example.com/path", "example.com"},
+		{"https://example.com", "example.com"},
+		{"https://example.com:8443/path", "example.com"},
+		{"https://user@example.com/path", "example.com"},
+		{"https://[::1]:8443/path", "::1"},
+		{"https://:sub.example.com/*", ":sub.example.com"},
+		{"https://:version.:sub.example.com/", ":version.:sub.example.com"},
+		{"https://:sub.example.com:8443/", ":sub.example.com"},
+	}
+
+	for _, tt := range tests {
+		got := extractHost(tt.input)
+		if got != tt.want {
+			t.Errorf("extractHost(%q) = %q, want %q", tt.input, got, tt.want)
 		}
 	}
 }

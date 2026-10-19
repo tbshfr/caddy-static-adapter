@@ -128,18 +128,11 @@ func matchHost(patternHost, requestHost string) bool {
 // For absolute URLs like "https://example.com/path", it extracts "/path".
 // For relative patterns like "/path/*", it returns them as-is.
 func extractPath(pattern string) string {
-	if strings.HasPrefix(pattern, "https://") {
-		// Parse the URL and extract just the path.
-		u, err := url.Parse(pattern)
-		if err != nil {
-			return pattern
-		}
-		if u.Path == "" {
-			return "/"
-		}
-		return u.Path
+	if !strings.HasPrefix(pattern, "https://") {
+		return pattern
 	}
-	return pattern
+	_, path := splitURLPattern(pattern)
+	return path
 }
 
 // extractHost extracts the host portion from an absolute URL pattern.
@@ -148,10 +141,57 @@ func extractHost(pattern string) string {
 	if !strings.HasPrefix(pattern, "https://") {
 		return ""
 	}
-	u, err := url.Parse(pattern)
-	if err != nil {
-		return ""
+	host, _ := splitURLPattern(pattern)
+	return host
+}
+
+// splitURLPattern splits an absolute https:// pattern into its host (without
+// userinfo or port, as Cloudflare ignores ports) and its decoded path.
+//
+// url.Parse can't be used here: it rejects host placeholders such as
+// https://:sub.example.com/* because it reads ":sub.example.com" as an
+// invalid port, which silently dropped the host constraint.
+func splitURLPattern(pattern string) (host, path string) {
+	rest := strings.TrimPrefix(pattern, "https://")
+
+	authority, path := rest, ""
+	if i := strings.IndexAny(rest, "/?#"); i >= 0 {
+		authority, path = rest[:i], rest[i:]
 	}
-	// Return hostname without port, as Cloudflare ignores ports.
-	return u.Hostname()
+	if i := strings.IndexAny(path, "?#"); i >= 0 {
+		path = path[:i]
+	}
+	if path == "" {
+		path = "/"
+	}
+	if decoded, err := url.PathUnescape(path); err == nil {
+		path = decoded
+	}
+
+	if i := strings.LastIndexByte(authority, '@'); i >= 0 {
+		authority = authority[i+1:]
+	}
+	return stripPatternPort(authority), path
+}
+
+// stripPatternPort removes a trailing :port from a pattern host. A colon
+// followed by anything other than digits is a placeholder, not a port.
+func stripPatternPort(host string) string {
+	if strings.HasPrefix(host, "[") {
+		if end := strings.IndexByte(host, ']'); end > 0 {
+			return host[1:end]
+		}
+		return host
+	}
+
+	i := strings.LastIndexByte(host, ':')
+	if i < 0 {
+		return host
+	}
+	for _, c := range host[i+1:] {
+		if c < '0' || c > '9' {
+			return host
+		}
+	}
+	return host[:i]
 }

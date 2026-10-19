@@ -232,16 +232,11 @@ func compileTemplate(raw string, p *compiledPattern) template {
 	// Longer tokens first, or :id would match inside :idx.
 	sort.SliceStable(tokens, func(i, j int) bool { return len(tokens[i].text) > len(tokens[j].text) })
 
-	// Only a literal '?' starts the query: substituted values are escaped,
-	// so they can't introduce one.
-	queryStart, queryEnd := strings.IndexByte(raw, '?'), len(raw)
-	if hash := strings.IndexByte(raw, '#'); hash >= 0 {
-		if hash < queryStart {
-			queryStart = -1
-		}
-		queryEnd = hash
-	}
-
+	// A literal '?' starts a query string, which a '#' or a character that
+	// can't appear in a URL ends, so that in a header value like
+	// Link: </a?v=1>, </b/:slug> the query of one URL doesn't cover the
+	// next. Substituted values are escaped, so they can't start one.
+	inQuery, inFragment := false, false
 	lit := 0
 	for i := 0; i < len(raw); {
 		matched := false
@@ -251,8 +246,7 @@ func compileTemplate(raw string, p *compiledPattern) template {
 					if lit < i {
 						t.parts = append(t.parts, templatePart{literal: raw[lit:i], slot: -1})
 					}
-					query := queryStart >= 0 && i > queryStart && i < queryEnd
-					t.parts = append(t.parts, templatePart{slot: tok.slot, query: query})
+					t.parts = append(t.parts, templatePart{slot: tok.slot, query: inQuery})
 					i += len(tok.text)
 					lit = i
 					matched = true
@@ -260,9 +254,18 @@ func compileTemplate(raw string, p *compiledPattern) template {
 				}
 			}
 		}
-		if !matched {
-			i++
+		if matched {
+			continue
 		}
+		switch raw[i] {
+		case '?':
+			inQuery = !inFragment
+		case '#':
+			inQuery, inFragment = false, true
+		case ' ', '\t', '"', '<', '>':
+			inQuery, inFragment = false, false
+		}
+		i++
 	}
 	if t.parts != nil && lit < len(raw) {
 		t.parts = append(t.parts, templatePart{literal: raw[lit:], slot: -1})

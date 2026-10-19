@@ -25,7 +25,7 @@ const (
 	OpRemove
 
 	// opAppend adds another value as a separate header line. It is only
-	// produced by mergeRepeatedHeaders for headers that must not be
+	// produced by compiledOps.mergeRepeated for headers that must not be
 	// comma-joined (see noCommaJoin).
 	opAppend
 )

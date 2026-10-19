@@ -1,6 +1,7 @@
 package staticadapter
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
 )
@@ -441,6 +443,51 @@ func TestServeHTTPBlocks_headers(t *testing.T) {
 			if !nextCalled {
 				t.Errorf("path %q: expected next handler to be called", tt.path)
 			}
+		}
+	}
+}
+
+func TestCleanRequestPath(t *testing.T) {
+	tests := []struct{ path, want string }{
+		{"/admin/x", "/admin/x"},
+		{"/admin/x/", "/admin/x/"},
+		{"/a.b/..c/.d", "/a.b/..c/.d"},
+		{"//admin/x", "/admin/x"},
+		{"/admin//x/", "/admin/x/"},
+		{"/./admin/x", "/admin/x"},
+		{"/a/../admin/x", "/admin/x"},
+		{"/admin/x/.", "/admin/x"},
+		{"/admin/x/..", "/admin"},
+	}
+	for _, tt := range tests {
+		if got := cleanRequestPath(tt.path); got != tt.want {
+			t.Errorf("cleanRequestPath(%q) = %q, want %q", tt.path, got, tt.want)
+		}
+	}
+}
+
+func TestServeHTTPMatchesCleanedPath(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "_headers"), []byte("/admin/*\n  X-Frame-Options: DENY\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := newTestHeadersHandler()
+	defer h.Cleanup()
+	next := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error { return nil })
+
+	// file_server serves /admin/x for all of these.
+	for _, path := range []string{"/admin/x", "//admin/x", "/./admin/x", "/a/../admin/x", "/admin/./x"} {
+		req := httptest.NewRequest("GET", path, nil)
+		repl := caddy.NewReplacer()
+		repl.Set("http.vars.root", dir)
+		req = req.WithContext(context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl))
+		rec := httptest.NewRecorder()
+		if err := h.ServeHTTP(rec, req, next); err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		if got := rec.Header().Get("X-Frame-Options"); got != "DENY" {
+			t.Errorf("%s: expected X-Frame-Options DENY, got %q", path, got)
 		}
 	}
 }

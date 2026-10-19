@@ -70,6 +70,7 @@ Each block starts with an unindented URL pattern, followed by indented header li
 - `:name` placeholders match a single path segment. Use `:name` in values to expand them. They can be combined with `*` in other segments, e.g. `/:lang/docs/*`.
 - Expanded values are percent-encoded as in a URL path (or query, after a `?`), so a request can't add cookie attributes or list items to a header.
 - Patterns starting with `https://` match against both host and path. Host labels can be placeholders, e.g. `https://:sub.example.com/*`.
+- Patterns match the path `file_server` serves, with dot segments resolved and repeated slashes merged, so `//admin/x` gets the headers of `/admin/*`.
 - All matching rules are applied, in file order.
 
 ### Limits

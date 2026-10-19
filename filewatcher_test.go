@@ -16,9 +16,15 @@ import (
 func (fh *fileHandler) expireCache() {
 	if files := fh.files.Load(); files != nil {
 		for _, f := range *files {
-			f.lastCheck.Store(0)
+			f.expire()
 		}
 	}
+}
+
+// expire makes f due for a check and older than any entry checked within
+// the last hour.
+func (f *cachedFile) expire() {
+	f.lastCheck.Store(monotonicNow() - int64(time.Hour))
 }
 
 // cachedData returns the currently cached data for filePath without triggering a reload.
@@ -670,7 +676,8 @@ func TestCheckOfEvictedEntryDoesNotResubscribe(t *testing.T) {
 		t.Skip("fsnotify watcher not available on this platform; skipping watcher test")
 	}
 	f := h.lookup(victim)
-	f.lastCheck.Store(0)
+	f.expire()
+	stale := f.lastCheck.Load()
 
 	// Hold mu so the request below wins the check but waits before running it.
 	h.mu.Lock()
@@ -679,13 +686,13 @@ func TestCheckOfEvictedEntryDoesNotResubscribe(t *testing.T) {
 		defer close(done)
 		h.getCached(victim)
 	}()
-	for f.lastCheck.Load() == 0 {
+	for f.lastCheck.Load() == stale {
 		time.Sleep(time.Millisecond)
 	}
 
 	// Evict the entry while the check waits, as if many other roots were
 	// added in the meantime.
-	f.lastCheck.Store(0)
+	f.expire()
 	h.addFileLocked(file(maxCachedFiles), &cachedFile{})
 	h.mu.Unlock()
 	<-done
@@ -708,7 +715,7 @@ func TestEvictionPrefersMissingFiles(t *testing.T) {
 	h := newTestRedirectHandler()
 	defer h.Cleanup()
 	h.getCached(loaded)
-	h.lookup(loaded).lastCheck.Store(0) // the least recently checked entry
+	h.lookup(loaded).expire() // the least recently checked entry
 
 	base := t.TempDir()
 	for i := 0; i < 2*maxCachedFiles; i++ {
@@ -717,5 +724,157 @@ func TestEvictionPrefersMissingFiles(t *testing.T) {
 
 	if h.cachedData(loaded) == nil {
 		t.Error("entries for missing files evicted the loaded rules")
+	}
+}
+
+// hubWatchInfo returns the identity of the directory the shared watcher
+// watches for dir, or nil when dir has no watch.
+func hubWatchInfo(dir string) os.FileInfo {
+	sharedWatcher.mu.Lock()
+	defer sharedWatcher.mu.Unlock()
+	if d := sharedWatcher.dirs[dir]; d != nil && d.watch != nil {
+		return d.watch.info
+	}
+	return nil
+}
+
+// headerValueOf returns the X-V header that the rules cached by h for file
+// set on /x, without triggering a check.
+func headerValueOf(h *Handler, file string) string {
+	c, _ := h.cachedData(file).(*Compiled)
+	if c == nil {
+		return ""
+	}
+	ops := c.MatchOrdered("/x", "")
+	if len(ops) != 1 {
+		return ""
+	}
+	return ops[0].Value
+}
+
+// TestWatcherRewatchesDirectoryRenamedBack covers a root renamed away and
+// back. It keeps its identity, but fsnotify stops watching it on the rename,
+// so the hub must forget the watch for the next check to add it again.
+func TestWatcherRewatchesDirectoryRenamedBack(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "site")
+	if err := os.Mkdir(root, 0755); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(root, "_headers")
+	if err := os.WriteFile(file, []byte("/x\n  X-V: 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := newTestHeadersHandler()
+	defer h.Cleanup()
+	h.getCompiled(file)
+	if !h.hasWatcher() {
+		t.Skip("fsnotify watcher not available on this platform; skipping watcher test")
+	}
+
+	waitFor := func(what string, cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(checkInterval / 2)
+		for time.Now().Before(deadline) {
+			if cond() {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for %s", what)
+	}
+
+	if err := os.Rename(root, root+".tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(root+".tmp", root); err != nil {
+		t.Fatal(err)
+	}
+	waitFor("the hub to drop the watch", func() bool { return hubWatchInfo(root) == nil })
+
+	h.expireCache()
+	h.getCompiled(file)
+	if hubWatchInfo(root) == nil {
+		t.Fatal("expected the check to watch the directory again")
+	}
+
+	// cachedData never polls, and the deadline is below checkInterval, so
+	// only a watcher event can satisfy this.
+	if err := os.WriteFile(file, []byte("/x\n  X-V: 2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	waitFor("reload via the new watch", func() bool { return headerValueOf(h, file) == "2" })
+}
+
+// TestWatcherReattachesSharedPathsByCurrentTarget covers three symlinks to
+// one directory sharing a watch known by the first. When the first and
+// second are re-pointed, the remaining paths must be attached to watches on
+// the directories they lead to now, not to the old one.
+func TestWatcherReattachesSharedPathsByCurrentTarget(t *testing.T) {
+	base := t.TempDir()
+	mkdir := func(name string) string {
+		dir := filepath.Join(base, name)
+		if err := os.Mkdir(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	a, b, c := mkdir("a"), mkdir("b"), mkdir("c")
+	if err := os.WriteFile(filepath.Join(a, "_headers"), []byte("/x\n  X-V: 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	links := []string{filepath.Join(base, "link0"), filepath.Join(base, "link1"), filepath.Join(base, "link2")}
+	for _, link := range links {
+		if err := os.Symlink(a, link); err != nil {
+			t.Skip("symlinks not supported:", err)
+		}
+	}
+	repoint := func(link, target string) {
+		tmp := link + ".tmp"
+		if err := os.Symlink(target, tmp); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(tmp, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	handlers := make([]*Handler, len(links))
+	for i, link := range links {
+		handlers[i] = newTestHeadersHandler()
+		defer handlers[i].Cleanup()
+		handlers[i].getCompiled(filepath.Join(link, "_headers"))
+		if !handlers[i].hasWatcher() {
+			t.Skip("fsnotify watcher not available on this platform; skipping watcher test")
+		}
+	}
+
+	repoint(links[0], b)
+	repoint(links[1], c)
+	// link0's check moves its watch, re-attaching link1 and link2.
+	handlers[0].expireCache()
+	handlers[0].getCompiled(filepath.Join(links[0], "_headers"))
+
+	for _, link := range links {
+		info, err := os.Stat(link)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if watched := hubWatchInfo(link); watched == nil || !os.SameFile(watched, info) {
+			t.Errorf("%s: watch is not on the directory it leads to", filepath.Base(link))
+		}
+	}
+
+	// link2 still leads to a, so an edit there must reach it via the watcher.
+	file := filepath.Join(links[2], "_headers")
+	if err := os.WriteFile(filepath.Join(a, "_headers"), []byte("/x\n  X-V: 2\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(checkInterval / 2)
+	for headerValueOf(handlers[2], file) != "2" {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out: link2 did not get the edit via the watcher")
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

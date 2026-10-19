@@ -28,12 +28,22 @@ const debounceDelay = 100 * time.Millisecond
 // (e.g. root * /srv/{host}), so the cache must not grow without limit.
 const maxCachedFiles = 64
 
+// clockStart anchors monotonicNow.
+var clockStart = time.Now()
+
+// monotonicNow returns the nanoseconds since clockStart, read from the
+// monotonic clock. With Unix time, a wall-clock step back (NTP, VM resume)
+// would suspend checks until the clock caught up again.
+func monotonicNow() int64 {
+	return int64(time.Since(clockStart))
+}
+
 // cachedFile holds the compiled data and reload state for one file path.
 // data and lastCheck are read without locking on every request; the other
 // fields are guarded by fileHandler.mu.
 type cachedFile struct {
 	data      atomic.Pointer[any] // handler-specific compiled data (e.g. *Compiled or *CompiledRedirects)
-	lastCheck atomic.Int64        // UnixNano of the last check
+	lastCheck atomic.Int64        // monotonicNow() at the last check
 
 	loaded  os.FileInfo // file version data was loaded from; nil before the first successful load
 	watched bool        // whether the file's directory is subscribed in sharedWatcher
@@ -116,7 +126,7 @@ type fileHandler struct {
 // that wins the compare-and-swap on lastCheck performs it, while concurrent
 // requests keep serving the current rules instead of queueing behind it.
 func (fh *fileHandler) getCached(filePath string) any {
-	now := time.Now().UnixNano()
+	now := monotonicNow()
 
 	if f := fh.lookup(filePath); f != nil {
 		last := f.lastCheck.Load()
@@ -212,7 +222,7 @@ func evictBefore(a, b *cachedFile) bool {
 // check (fixing permissions doesn't change the mtime), but each distinct
 // error is logged only once.
 func (fh *fileHandler) refreshLocked(filePath string, f *cachedFile, force bool) {
-	info, err := os.Stat(filePath)
+	info, err := statIdentity(filePath)
 	if os.IsNotExist(err) {
 		f.set(nil)
 		f.lastErr = ""
@@ -247,6 +257,18 @@ func fileChanged(loaded, info os.FileInfo) bool {
 		!os.SameFile(loaded, info) ||
 		loaded.Size() != info.Size() ||
 		!loaded.ModTime().Equal(info.ModTime())
+}
+
+// statIdentity is os.Stat that also reads the file's identity right away.
+// On Windows, os.Stat only records the path and os.SameFile reads the file
+// ID on first use, which after a deploy replaced the file would already be
+// the new file's.
+func statIdentity(name string) (os.FileInfo, error) {
+	info, err := os.Stat(name)
+	if err == nil {
+		os.SameFile(info, info)
+	}
+	return info, err
 }
 
 // logLoadErrorLocked logs err unless it is the same error that was last
@@ -325,7 +347,7 @@ func (fh *fileHandler) reloadInBackground(filePath string) {
 
 	fh.mu.Lock()
 	defer fh.mu.Unlock()
-	f.lastCheck.Store(time.Now().UnixNano())
+	f.lastCheck.Store(monotonicNow())
 	fh.refreshLocked(filePath, f, true)
 }
 

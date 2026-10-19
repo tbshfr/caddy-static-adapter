@@ -258,16 +258,11 @@ func expandOps(cr *compiledRule, ops compiledOps, path string) []HeaderOp {
 	return expanded
 }
 
-// mergeRepeatedHeaders comma-joins repeated sets of the same header within
-// one rule. A remove resets the header, so a set after it starts a new value.
-// Headers that must not be comma-joined keep one op per value, with every
-// value after the first turned into an append.
-func mergeRepeatedHeaders(ops []HeaderOp) []HeaderOp {
-	return compiledOps{ops: ops}.mergeRepeated().ops
-}
-
-// mergeRepeated is mergeRepeatedHeaders for compiled ops, joining the
-// compiled values along with the raw ones.
+// mergeRepeated comma-joins repeated sets of the same header within one
+// rule, joining the compiled values along with the raw ones. A remove resets
+// the header, so a set after it starts a new value. Headers that must not be
+// comma-joined keep one op per value, with every value after the first
+// turned into an append.
 func (c compiledOps) mergeRepeated() compiledOps {
 	merged := compiledOps{ops: make([]HeaderOp, 0, len(c.ops)), dynamic: c.dynamic}
 	if c.values != nil {

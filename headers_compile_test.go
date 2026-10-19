@@ -730,7 +730,7 @@ func TestMergeRepeatedHeadersRemoveResets(t *testing.T) {
 		{Name: "X-A", Value: "4", Mode: OpSet},
 	}
 	headers := make(http.Header)
-	applyHeaders(headers, mergeRepeatedHeaders(ops), true)
+	applyHeaders(headers, compiledOps{ops: ops}.mergeRepeated().ops, true)
 	if got, want := headers.Get("X-A"), "3, 4"; got != want {
 		t.Errorf("want %q, got %q", want, got)
 	}
@@ -891,7 +891,7 @@ func TestSetCookieRemoveResetsWithinRule(t *testing.T) {
 		{Name: "Set-Cookie", Value: "c=3", Mode: OpSet},
 	}
 	headers := http.Header{"Set-Cookie": {"upstream=1"}}
-	applyHeaders(headers, mergeRepeatedHeaders(ops), true)
+	applyHeaders(headers, compiledOps{ops: ops}.mergeRepeated().ops, true)
 	if got := headers.Values("Set-Cookie"); strings.Join(got, "|") != "b=2|c=3" {
 		t.Errorf("want [b=2 c=3], got %q", got)
 	}
@@ -931,5 +931,23 @@ func TestDedupMergedValuesKeepEscaping(t *testing.T) {
 	// The '?' of the first value must not make :name in the second a query value.
 	if got, want := headers.Get("Link"), "</a?x=1>, </p/a%20b>"; got != want {
 		t.Errorf("want %q, got %q", want, got)
+	}
+}
+
+func TestHeaderQueryEscapingEndsWithURL(t *testing.T) {
+	rules, _ := Parse(strings.NewReader(`/b/:slug
+  Link: </s?v=1>; rel=preload, </b/:slug/data.json>; rel=prefetch
+  X-Urls: /a#top /find?q=:slug
+`), 0, 0, 0)
+	c := Compile(rules)
+
+	headers := make(http.Header)
+	applyHeaders(headers, c.MatchOrdered("/b/a b+c&d", ""), false)
+	if got, want := headers.Get("Link"), "</s?v=1>; rel=preload, </b/a%20b+c&d/data.json>; rel=prefetch"; got != want {
+		t.Errorf("Link: want %q, got %q", want, got)
+	}
+	// A '?' after a fragment of an earlier URL still starts a query.
+	if got, want := headers.Get("X-Urls"), "/a#top /find?q=a+b%2Bc%26d"; got != want {
+		t.Errorf("X-Urls: want %q, got %q", want, got)
 	}
 }

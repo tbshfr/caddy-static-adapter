@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 
 	"github.com/caddyserver/caddy/v2"
@@ -56,7 +57,7 @@ type reloadTarget struct {
 // renamed release directory or a re-pointed symlink) it is moved to the
 // new one.
 func (h *watchHub) subscribe(dir string, fh *fileHandler) error {
-	info, statErr := os.Stat(dir)
+	info, statErr := statIdentity(dir)
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -112,6 +113,7 @@ func (h *watchHub) attachLocked(dir string, d *hubDir, info os.FileInfo) error {
 		h.watcher = watcher
 		h.watches = make(map[string]*hubWatch)
 		go h.loop(watcher)
+		go logWatchErrors(watcher)
 	}
 	if err := h.watcher.Add(dir); err != nil {
 		return err
@@ -140,9 +142,35 @@ func (h *watchHub) detachLocked(dir string, d *hubDir) {
 	delete(h.watches, w.path)
 	for p, other := range w.dirs {
 		other.watch = nil
-		// On failure, the next subscribe of p retries, as other.watch is nil.
-		_ = h.attachLocked(p, other, w.info)
+		// p may lead elsewhere by now too, e.g. when two symlinks were
+		// re-pointed, so it is attached by its current target. On failure,
+		// the next subscribe of p retries, as other.watch is nil.
+		if info, err := statIdentity(p); err == nil {
+			_ = h.attachLocked(p, other, info)
+		}
 	}
+}
+
+// dropWatch forgets the watch on dir once fsnotify stopped watching it,
+// which it does when the directory itself is renamed or removed. A
+// directory renamed away and back keeps its identity, so subscribe would
+// otherwise keep treating it as watched. Its subscribers add a new watch on
+// their next check.
+func (h *watchHub) dropWatch(watcher *fsnotify.Watcher, dir string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	w := h.watches[dir]
+	// The event may be older than a watch added for dir since, e.g. after a
+	// deploy replaced the directory.
+	if w == nil || h.watcher != watcher || slices.Contains(watcher.WatchList(), dir) {
+		return
+	}
+	delete(h.watches, dir)
+	for _, d := range w.dirs {
+		d.watch = nil
+	}
+	h.closeIfIdleLocked()
 }
 
 // unsubscribe stops notifying fh about dir, removing the watch when no
@@ -205,23 +233,25 @@ func (h *watchHub) targetsFor(filePath string) []reloadTarget {
 // loop forwards events for watched files to the handlers subscribed to
 // their directory.
 func (h *watchHub) loop(watcher *fsnotify.Watcher) {
-	for {
-		select {
-		case event, ok := <-watcher.Events:
-			if !ok {
-				return
-			}
-			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) == 0 {
-				continue
-			}
-			for _, t := range h.targetsFor(filepath.Clean(event.Name)) {
-				t.fh.scheduleReload(t.filePath)
-			}
-		case err, ok := <-watcher.Errors:
-			if !ok {
-				return
-			}
-			caddy.Log().Named("static_adapter").Warn("file watcher error", zap.Error(err))
+	for event := range watcher.Events {
+		if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) == 0 {
+			continue
 		}
+		name := filepath.Clean(event.Name)
+		if event.Op&(fsnotify.Rename|fsnotify.Remove) != 0 {
+			h.dropWatch(watcher, name)
+		}
+		for _, t := range h.targetsFor(name) {
+			t.fh.scheduleReload(t.filePath)
+		}
+	}
+}
+
+// logWatchErrors logs the watcher's errors. It must not run in loop, which
+// waits for h.mu: fsnotify reports some errors while holding its own lock,
+// which subscribe and dropWatch wait for under h.mu.
+func logWatchErrors(watcher *fsnotify.Watcher) {
+	for err := range watcher.Errors {
+		caddy.Log().Named("static_adapter").Warn("file watcher error", zap.Error(err))
 	}
 }

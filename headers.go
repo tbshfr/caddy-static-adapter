@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -68,16 +69,36 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		if h, _, err := net.SplitHostPort(host); err == nil {
 			host = h
 		}
+		path := cleanRequestPath(r.URL.Path)
 		var ops []HeaderOp
 		if h.Dedup {
-			ops = compiled.MatchBySpecificity(r.URL.Path, host)
+			ops = compiled.MatchBySpecificity(path, host)
 		} else {
-			ops = compiled.MatchOrdered(r.URL.Path, host)
+			ops = compiled.MatchOrdered(path, host)
 		}
 		applyHeaders(w.Header(), ops, h.Dedup)
 	}
 
 	return next.ServeHTTP(w, r)
+}
+
+// cleanRequestPath resolves dot segments and merges repeated slashes, as
+// file_server does when it maps a request path to a file. Matching the raw
+// path would let //admin/x or /a/../admin/x be served the file /admin/x
+// without the headers of an /admin/* rule. Clean paths, the common case,
+// are returned as they are, without allocating.
+func cleanRequestPath(p string) string {
+	for i := 0; i < len(p); i++ {
+		if p[i] != '/' {
+			continue
+		}
+		switch rest := p[i+1:]; {
+		case strings.HasPrefix(rest, "/"), strings.HasPrefix(rest, "./"), strings.HasPrefix(rest, "../"),
+			rest == ".", rest == "..":
+			return caddyhttp.CleanPath(p, true)
+		}
+	}
+	return p
 }
 
 // getCompiled returns the compiled header rules for the given file path.

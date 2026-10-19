@@ -1,7 +1,6 @@
 package staticadapter
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"strconv"
@@ -60,52 +59,29 @@ func ParseRedirects(r io.Reader, maxRules, maxFileSize, maxLineLength int) ([]*R
 		maxLineLength = RedirectMaxLineLength
 	}
 
-	lr := io.LimitReader(r, int64(maxFileSize)+1)
-	scanner := bufio.NewScanner(lr)
-	scanner.Buffer(make([]byte, 0, maxLineLength+256), maxLineLength+256)
-
 	var rules []*RedirectRule
 	var warnings []error
-	lineNum := 0
-	totalBytes := 0
 
-	for scanner.Scan() {
-		lineNum++
-		line := scanner.Text()
-		totalBytes += len(line) + 1 // +1 for newline
-
-		if totalBytes > maxFileSize {
-			warnings = append(warnings, &ParseError{Line: lineNum, Message: fmt.Sprintf("file exceeds maximum size of %d bytes", maxFileSize)})
-			break
-		}
-
-		if len(line) > maxLineLength {
-			warnings = append(warnings, &ParseError{Line: lineNum, Message: fmt.Sprintf("line exceeds maximum length of %d characters", maxLineLength)})
-			continue
-		}
-
+	scanLines(r, maxFileSize, maxLineLength, &warnings, func(lineNum int, line string) bool {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
+			return false
 		}
 
 		rule, err := parseRedirectLine(trimmed, lineNum)
 		if err != nil {
 			warnings = append(warnings, err)
-			continue
+			return false
 		}
 
 		if len(rules) >= maxRules {
 			warnings = append(warnings, &ParseError{Line: lineNum, Message: fmt.Sprintf("exceeds maximum of %d redirect rules", maxRules)})
-			break
+			return true
 		}
 
 		rules = append(rules, rule)
-	}
-
-	if err := scanner.Err(); err != nil {
-		warnings = append(warnings, fmt.Errorf("scanner error: %w", err))
-	}
+		return false
+	})
 
 	return rules, warnings
 }

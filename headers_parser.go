@@ -1,7 +1,6 @@
 package staticadapter
 
 import (
-	"bufio"
 	"fmt"
 	"io"
 	"net/http"
@@ -53,36 +52,15 @@ func Parse(r io.Reader, maxRules, maxFileSize, maxLineLength int) ([]*Rule, []er
 		maxLineLength = HeaderMaxLineLength
 	}
 
-	lr := io.LimitReader(r, int64(maxFileSize)+1)
-	scanner := bufio.NewScanner(lr)
-	// Set a buffer large enough for max line length.
-	scanner.Buffer(make([]byte, 0, maxLineLength+256), maxLineLength+256)
-
 	var rules []*Rule
 	var warnings []error
 	var current *Rule
-	lineNum := 0
-	totalBytes := 0
 
-	for scanner.Scan() {
-		lineNum++
-		line := scanner.Text()
-		totalBytes += len(line) + 1 // +1 for newline
-
-		if totalBytes > maxFileSize {
-			warnings = append(warnings, &ParseError{Line: lineNum, Message: fmt.Sprintf("file exceeds maximum size of %d bytes", maxFileSize)})
-			break
-		}
-
-		if len(line) > maxLineLength {
-			warnings = append(warnings, &ParseError{Line: lineNum, Message: fmt.Sprintf("line exceeds maximum length of %d characters", maxLineLength)})
-			continue
-		}
-
-		// Remove inline comments and check for comment/blank lines.
+	scanLines(r, maxFileSize, maxLineLength, &warnings, func(lineNum int, line string) bool {
+		// Skip comment and blank lines.
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
+			return false
 		}
 
 		// Determine if this is a header line (indented) or a URL pattern line.
@@ -91,40 +69,38 @@ func Parse(r io.Reader, maxRules, maxFileSize, maxLineLength int) ([]*Rule, []er
 		if isIndented {
 			if current == nil {
 				warnings = append(warnings, &ParseError{Line: lineNum, Message: "header line without preceding URL pattern"})
-				continue
+				return false
 			}
 
 			op, err := parseHeaderLine(trimmed, lineNum)
 			if err != nil {
 				warnings = append(warnings, err)
-				continue
+				return false
 			}
 			current.Ops = append(current.Ops, op)
-		} else {
-			// This is a URL pattern line.
-			pattern := trimmed
-
-			if err := validatePattern(pattern, lineNum); err != nil {
-				warnings = append(warnings, err)
-				continue
-			}
-
-			if len(rules) >= maxRules {
-				warnings = append(warnings, &ParseError{Line: lineNum, Message: fmt.Sprintf("exceeds maximum of %d rules", maxRules)})
-				break
-			}
-
-			current = &Rule{
-				Pattern: pattern,
-				Line:    lineNum,
-			}
-			rules = append(rules, current)
+			return false
 		}
-	}
 
-	if err := scanner.Err(); err != nil {
-		warnings = append(warnings, fmt.Errorf("scanner error: %w", err))
-	}
+		// This is a URL pattern line.
+		pattern := trimmed
+
+		if err := validatePattern(pattern, lineNum); err != nil {
+			warnings = append(warnings, err)
+			return false
+		}
+
+		if len(rules) >= maxRules {
+			warnings = append(warnings, &ParseError{Line: lineNum, Message: fmt.Sprintf("exceeds maximum of %d rules", maxRules)})
+			return true
+		}
+
+		current = &Rule{
+			Pattern: pattern,
+			Line:    lineNum,
+		}
+		rules = append(rules, current)
+		return false
+	})
 
 	return rules, warnings
 }

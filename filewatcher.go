@@ -30,11 +30,11 @@ const maxCachedFiles = 64
 
 // cachedFile holds the compiled data and reload state for one file path.
 type cachedFile struct {
-	data      any // handler-specific compiled data (e.g. *Compiled or *CompiledRedirects)
-	modTime   time.Time
-	lastCheck time.Time
-	watched   bool   // whether the file's directory was added to the watcher
-	lastErr   string // last load error, so a persisting error is logged only once
+	data       any         // handler-specific compiled data (e.g. *Compiled or *CompiledRedirects)
+	loaded     os.FileInfo // file version data was loaded from; nil before the first successful load
+	lastCheck  time.Time
+	watchedDir os.FileInfo // directory the watch was added for; nil when not watched
+	lastErr    string      // last load error, so a persisting error is logged only once
 }
 
 // fileHandler provides shared file-watching, caching, and reload
@@ -134,7 +134,7 @@ func (fh *fileHandler) addFileLocked(filePath string) *cachedFile {
 				oldestPath, oldest = p, f
 			}
 		}
-		if oldest.watched && fh.watcher != nil {
+		if oldest.watchedDir != nil && fh.watcher != nil {
 			_ = fh.watcher.Remove(filepath.Dir(oldestPath))
 		}
 		delete(fh.files, oldestPath)
@@ -165,7 +165,7 @@ func (fh *fileHandler) refreshLocked(filePath string, f *cachedFile, force bool)
 		return
 	}
 
-	if !force && f.data != nil && f.lastErr == "" && info.ModTime().Equal(f.modTime) {
+	if !force && f.data != nil && f.lastErr == "" && !fileChanged(f.loaded, info) {
 		return
 	}
 
@@ -175,8 +175,20 @@ func (fh *fileHandler) refreshLocked(filePath string, f *cachedFile, force bool)
 		return
 	}
 	f.data = data
-	f.modTime = info.ModTime()
+	f.loaded = info
 	f.lastErr = ""
+}
+
+// fileChanged reports whether info describes a different version of the
+// file than loaded. Comparing size and identity (inode) besides the mtime
+// catches deploys that preserve mtimes (rsync -t, cp -p, Nix) as long as
+// they replace the file or change its size; atomic renames, symlink swaps
+// and directory swaps always produce a new identity.
+func fileChanged(loaded, info os.FileInfo) bool {
+	return loaded == nil ||
+		!os.SameFile(loaded, info) ||
+		loaded.Size() != info.Size() ||
+		!loaded.ModTime().Equal(info.ModTime())
 }
 
 // logLoadErrorLocked logs err unless it is the same error that was last
@@ -196,9 +208,23 @@ func (fh *fileHandler) logLoadErrorLocked(filePath string, f *cachedFile, err er
 // watcher so that changes are detected instantly, creating the watcher on
 // first use. Falls back to polling if the watcher cannot be created or the
 // directory cannot be watched. Must be called with fh.mu held for writing.
+//
+// The watch follows the directory it was added for, not its path. When the
+// directory is replaced (a renamed release directory or a re-pointed
+// symlink, as common in deploys) the watch is moved to the new one.
 func (fh *fileHandler) ensureWatchingLocked(filePath string, f *cachedFile) {
-	if f.watched {
-		return
+	dir := filepath.Dir(filePath)
+	dirInfo, err := os.Stat(dir)
+
+	if f.watchedDir != nil {
+		if err == nil && os.SameFile(f.watchedDir, dirInfo) {
+			return
+		}
+		_ = fh.watcher.Remove(dir)
+		f.watchedDir = nil
+	}
+	if err != nil {
+		return // directory missing; polling picks the file up once it appears
 	}
 
 	if fh.watcher == nil {
@@ -213,14 +239,13 @@ func (fh *fileHandler) ensureWatchingLocked(filePath string, f *cachedFile) {
 		go fh.watchLoop(watcher, fh.stopWatch)
 	}
 
-	dir := filepath.Dir(filePath)
 	if err := fh.watcher.Add(dir); err != nil {
 		fh.logger.Warn(fh.logPrefix+": failed to watch directory, falling back to polling",
 			zap.String("dir", dir),
 			zap.Error(err))
 		return
 	}
-	f.watched = true
+	f.watchedDir = dirInfo
 }
 
 // watchLoop listens for filesystem events and proactively reloads the
@@ -291,7 +316,7 @@ func (fh *fileHandler) closeWatcherLocked() {
 		fh.watcher = nil
 	}
 	for _, f := range fh.files {
-		f.watched = false
+		f.watchedDir = nil
 	}
 }
 

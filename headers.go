@@ -1,6 +1,7 @@
 package staticadapter
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -90,22 +91,20 @@ func (h *Handler) getCompiled(filePath string) *Compiled {
 
 // loadFile reads and compiles the _headers file. Called by the shared
 // fileHandler infrastructure under write lock.
-func (h *Handler) loadFile(filePath string) any {
+func (h *Handler) loadFile(filePath string) (any, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
-		h.logger.Warn(h.logPrefix+": failed to open file",
-			zap.String("file", filePath),
-			zap.Error(err))
-		return nil
+		return nil, fmt.Errorf("failed to open file: %w", err)
 	}
 	defer f.Close()
 
 	rules, warnings := Parse(f, h.MaxRules, h.MaxFileSize, h.MaxLineLength)
-	for _, w := range warnings {
-		if h.Strict {
-			h.logger.Error(h.logPrefix+": parse error (strict mode)", zap.Error(w))
-			return nil
+	if h.Strict {
+		if err := firstStrictError(warnings); err != nil {
+			return nil, fmt.Errorf("parse error (strict mode): %w", err)
 		}
+	}
+	for _, w := range warnings {
 		h.logger.Warn(h.logPrefix+": parse warning", zap.Error(w))
 	}
 
@@ -113,7 +112,7 @@ func (h *Handler) loadFile(filePath string) any {
 	h.logger.Info(h.logPrefix+": loaded rules",
 		zap.String("file", filePath),
 		zap.Int("total_rules", len(rules)))
-	return compiled
+	return compiled, nil
 }
 
 // applyHeaders applies the given header operations to the response headers.

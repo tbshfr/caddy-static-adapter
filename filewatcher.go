@@ -1,6 +1,7 @@
 package staticadapter
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -32,7 +33,8 @@ type cachedFile struct {
 	data      any // handler-specific compiled data (e.g. *Compiled or *CompiledRedirects)
 	modTime   time.Time
 	lastCheck time.Time
-	watched   bool // whether the file's directory was added to the watcher
+	watched   bool   // whether the file's directory was added to the watcher
+	lastErr   string // last load error, so a persisting error is logged only once
 }
 
 // fileHandler provides shared file-watching, caching, and reload
@@ -77,8 +79,9 @@ type fileHandler struct {
 	stopWatch chan struct{}
 
 	// loadFn is called under write lock to load and compile the file.
-	// It must return the handler-specific compiled data or nil on failure.
-	loadFn func(filePath string) any
+	// It returns the handler-specific compiled data, or an error when the
+	// file could not be read or was rejected in strict mode.
+	loadFn func(filePath string) (any, error)
 }
 
 // getCached returns the cached compiled data for the given file path,
@@ -143,26 +146,50 @@ func (fh *fileHandler) addFileLocked(filePath string) *cachedFile {
 }
 
 // refreshLocked stats filePath and reloads it when it changed since the
-// last load, or unconditionally when force is set. Must be called with
-// fh.mu held for writing.
+// last successful load, or unconditionally when force is set. Must be
+// called with fh.mu held for writing.
+//
+// A failed load keeps the previously loaded rules, so a broken deploy does
+// not silently strip headers such as a CSP. Failures are retried on every
+// check (fixing permissions doesn't change the mtime), but each distinct
+// error is logged only once.
 func (fh *fileHandler) refreshLocked(filePath string, f *cachedFile, force bool) {
 	info, err := os.Stat(filePath)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			fh.logger.Warn(fh.logPrefix+": failed to stat file",
-				zap.String("file", filePath),
-				zap.Error(err))
-		}
+	if os.IsNotExist(err) {
 		f.data = nil
+		f.lastErr = ""
+		return
+	}
+	if err != nil {
+		fh.logLoadErrorLocked(filePath, f, fmt.Errorf("failed to stat file: %w", err))
 		return
 	}
 
-	if !force && f.data != nil && info.ModTime().Equal(f.modTime) {
+	if !force && f.data != nil && f.lastErr == "" && info.ModTime().Equal(f.modTime) {
 		return
 	}
 
+	data, err := fh.loadFn(filePath)
+	if err != nil {
+		fh.logLoadErrorLocked(filePath, f, err)
+		return
+	}
+	f.data = data
 	f.modTime = info.ModTime()
-	f.data = fh.loadFn(filePath)
+	f.lastErr = ""
+}
+
+// logLoadErrorLocked logs err unless it is the same error that was last
+// logged for this file. Must be called with fh.mu held for writing.
+func (fh *fileHandler) logLoadErrorLocked(filePath string, f *cachedFile, err error) {
+	if err.Error() == f.lastErr {
+		return
+	}
+	f.lastErr = err.Error()
+	fh.logger.Error(fh.logPrefix+": failed to load file",
+		zap.String("file", filePath),
+		zap.Bool("keeping_previous_rules", f.data != nil),
+		zap.Error(err))
 }
 
 // ensureWatchingLocked adds the directory of filePath to the filesystem

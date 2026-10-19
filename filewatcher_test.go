@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // expireCache forces the next getCached call for every path to re-check the file.
@@ -41,7 +44,7 @@ func TestGetCachedMultipleRootsLoadOnce(t *testing.T) {
 	defer h.Cleanup()
 	loads := 0
 	load := h.loadFn
-	h.loadFn = func(p string) any { loads++; return load(p) }
+	h.loadFn = func(p string) (any, error) { loads++; return load(p) }
 
 	for i := 0; i < 100; i++ {
 		file, want := fileA, "/a"
@@ -118,4 +121,113 @@ func TestWatcherReloadsEachRoot(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("timed out: watcher did not reload both files")
+}
+
+// writeWithMtime writes content and sets a distinct mtime so polling sees a change.
+func writeWithMtime(t *testing.T, file, content string, offset time.Duration) {
+	t.Helper()
+	if err := os.WriteFile(file, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	mtime := time.Now().Add(offset)
+	if err := os.Chtimes(file, mtime, mtime); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStrictFailureKeepsPreviousRules(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "_redirects")
+	writeWithMtime(t, file, "/old /new 301\n", 0)
+
+	h := newTestRedirectHandler()
+	h.Strict = true
+	defer h.Cleanup()
+
+	if h.getCompiledRedirects(file).MatchFirst("/old") == nil {
+		t.Fatal("expected initial rules to load")
+	}
+
+	writeWithMtime(t, file, "/old /new 301\nbroken\n", 10*time.Second)
+	h.expireCache()
+
+	compiled := h.getCompiledRedirects(file)
+	if compiled == nil || compiled.MatchFirst("/old") == nil {
+		t.Fatal("expected previous rules to stay active after a strict-mode failure")
+	}
+
+	writeWithMtime(t, file, "/old /newer 301\n", 20*time.Second)
+	h.expireCache()
+
+	match := h.getCompiledRedirects(file).MatchFirst("/old")
+	if match == nil || match.To != "/newer" {
+		t.Fatalf("expected fixed file to load, got %+v", match)
+	}
+}
+
+func TestLoadErrorLoggedOnce(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "_redirects")
+	writeWithMtime(t, file, "broken\n", 0)
+
+	core, logs := observer.New(zap.ErrorLevel)
+	h := newTestRedirectHandler()
+	h.Strict = true
+	h.logger = zap.New(core)
+	defer h.Cleanup()
+
+	for i := 0; i < 5; i++ {
+		h.expireCache()
+		if h.getCompiledRedirects(file) != nil {
+			t.Fatal("expected no rules for a file that fails strict mode on first load")
+		}
+	}
+	if n := logs.Len(); n != 1 {
+		t.Fatalf("expected the persisting error to be logged once, got %d entries", n)
+	}
+
+	// A different error is logged again.
+	writeWithMtime(t, file, "/ok /fine 301\nstill broken\n", 10*time.Second)
+	h.expireCache()
+	h.getCompiledRedirects(file)
+	if n := logs.Len(); n != 2 {
+		t.Fatalf("expected a new error to be logged, got %d entries", n)
+	}
+
+	// After a successful load the same error is reported again if it comes back.
+	writeWithMtime(t, file, "/ok /fine 301\n", 20*time.Second)
+	h.expireCache()
+	h.getCompiledRedirects(file)
+	writeWithMtime(t, file, "/ok /fine 301\nstill broken\n", 30*time.Second)
+	h.expireCache()
+	h.getCompiledRedirects(file)
+	if n := logs.Len(); n != 3 {
+		t.Fatalf("expected recurring error to be logged again after recovery, got %d entries", n)
+	}
+}
+
+func TestUnreadableFileRetriedWithoutMtimeChange(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read files regardless of permissions")
+	}
+	file := filepath.Join(t.TempDir(), "_redirects")
+	writeWithMtime(t, file, "/old /new 301\n", 0)
+	if err := os.Chmod(file, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	h := newTestRedirectHandler()
+	defer h.Cleanup()
+
+	if h.getCompiledRedirects(file) != nil {
+		t.Fatal("expected no rules while the file is unreadable")
+	}
+
+	if err := os.Chmod(file, 0644); err != nil {
+		t.Fatal(err)
+	}
+	h.expireCache()
+
+	compiled := h.getCompiledRedirects(file)
+	if compiled == nil || compiled.MatchFirst("/old") == nil {
+		t.Fatal("expected rules to load once the file is readable again")
+	}
 }

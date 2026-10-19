@@ -16,3 +16,15 @@ type ParseError struct {
 func (e *ParseError) Error() string {
 	return fmt.Sprintf("line %d: %s", e.Line, e.Message)
 }
+
+// firstStrictError returns the first warning that fails strict mode, or nil.
+// Warnings marked NonStrict (e.g. unsupported 404/410 redirect rules) never do.
+func firstStrictError(warnings []error) error {
+	for _, w := range warnings {
+		if pe, ok := w.(*ParseError); ok && pe.NonStrict {
+			continue
+		}
+		return w
+	}
+	return nil
+}

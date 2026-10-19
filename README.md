@@ -165,7 +165,7 @@ static_redirects {
 
 | Option | Description |
 |---|---|
-| `strict` | Any parse warning discards **all** rules (default: log warnings, keep valid rules) |
+| `strict` | Any parse warning rejects the **whole** file (default: log warnings, keep valid rules). A rejected or unreadable file keeps the previously loaded rules active until a valid version is loaded. |
 | `dedup` | When the same header is set by multiple matching rules, the most specific pattern wins instead of comma-joining (default: off). Rules are ordered from least to most specific, and the final (most specific) matching rule overwrites earlier ones. Exact matches are the most specific; other patterns rank by their number of literal characters (placeholders and `*` don't count), and at equal length a placeholder pattern beats a `*` pattern. A header repeated within a single rule is still comma-joined. Useful for `_headers` files with overlapping wildcard rules. Only applies to `static_headers`. |
 | `max_rules` | Max number of rules. Default: 100 for headers, 2000 for redirects |
 | `max_file_size` | Max file size in bytes (default: 1048576) |

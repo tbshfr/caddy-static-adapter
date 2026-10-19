@@ -1,6 +1,7 @@
 package staticadapter
 
 import (
+	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -167,28 +168,20 @@ func (h *RedirectHandler) getCompiledRedirects(filePath string) *CompiledRedirec
 
 // loadRedirectFile reads and compiles the _redirects file. Called by the
 // shared fileHandler infrastructure under write lock.
-func (h *RedirectHandler) loadRedirectFile(filePath string) any {
+func (h *RedirectHandler) loadRedirectFile(filePath string) (any, error) {
 	f, err := os.Open(filePath)
 	if err != nil {
-		h.logger.Warn(h.logPrefix+": failed to open file",
-			zap.String("file", filePath),
-			zap.Error(err))
-		return nil
+		return nil, fmt.Errorf("failed to open file: %w", err)
 	}
 	defer f.Close()
 
 	parsed, warnings := ParseRedirects(f, h.MaxRules, h.MaxFileSize, h.MaxLineLength)
-	for _, w := range warnings {
-		if h.Strict {
-			// NonStrict warnings (e.g. unsupported 404/410 rules) are
-			// always logged as warnings, never cause strict-mode failure.
-			if pe, ok := w.(*ParseError); ok && pe.NonStrict {
-				h.logger.Warn(h.logPrefix+": parse warning", zap.Error(w))
-				continue
-			}
-			h.logger.Error(h.logPrefix+": parse error (strict mode)", zap.Error(w))
-			return nil
+	if h.Strict {
+		if err := firstStrictError(warnings); err != nil {
+			return nil, fmt.Errorf("parse error (strict mode): %w", err)
 		}
+	}
+	for _, w := range warnings {
 		h.logger.Warn(h.logPrefix+": parse warning", zap.Error(w))
 	}
 
@@ -205,7 +198,7 @@ func (h *RedirectHandler) loadRedirectFile(filePath string) any {
 	h.logger.Info(h.logPrefix+": loaded redirect rules",
 		zap.String("file", filePath),
 		zap.Int("total_rules", len(rules)))
-	return compiled
+	return compiled, nil
 }
 
 // matchRedirect checks whether a request path matches a compiled redirect rule.

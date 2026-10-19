@@ -302,3 +302,21 @@ func TestRedirectPlaceholderSharingSegmentWithSplatRejected(t *testing.T) {
 		t.Fatalf("expected rule to be rejected with 1 warning, got %d rules, warnings %v", len(rules), warnings)
 	}
 }
+
+func TestRedirectQueryPlaceholdersEscaped(t *testing.T) {
+	tests := []struct {
+		from, to, path, want string
+	}{
+		{"/products/:code", "/items?code=:code&x=1", "/products/a&admin=1", "/items?code=a%26admin%3D1&x=1"},
+		{"/s/*", "/search?q=:splat", "/s/a/b c", "/search?q=a%2Fb+c"},
+		{"/v/:v", "/x/:v?y=:v", "/v/a b&c", "/x/a%20b&c?y=a+b%26c"},
+		{"/v/:v", "/x#:v?:v", "/v/a&b", "/x#a&b?a&b"},
+		{"/v/:v", "https://example.com/:v?ref=:v#top", "/v/a=b", "https://example.com/a=b?ref=a%3Db#top"},
+	}
+	for _, tt := range tests {
+		got := newCompiledRedirect(&RedirectRule{From: tt.from, To: tt.to}).expand(tt.path)
+		if got != tt.want {
+			t.Errorf("%s -> %s for %s: want %s, got %s", tt.from, tt.to, tt.path, tt.want, got)
+		}
+	}
+}

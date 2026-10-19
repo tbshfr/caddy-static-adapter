@@ -196,6 +196,7 @@ const splatSlot = -2
 type templatePart struct {
 	literal string
 	slot    int
+	query   bool // reference lies in the query string of a URL template
 }
 
 // template is a header value or redirect destination whose :name and
@@ -227,6 +228,16 @@ func compileTemplate(raw string, p *compiledPattern) template {
 	// Longer tokens first, or :id would match inside :idx.
 	sort.SliceStable(tokens, func(i, j int) bool { return len(tokens[i].text) > len(tokens[j].text) })
 
+	// Only a literal '?' starts the query: substituted values are escaped,
+	// so they can't introduce one.
+	queryStart, queryEnd := strings.IndexByte(raw, '?'), len(raw)
+	if hash := strings.IndexByte(raw, '#'); hash >= 0 {
+		if hash < queryStart {
+			queryStart = -1
+		}
+		queryEnd = hash
+	}
+
 	lit := 0
 	for i := 0; i < len(raw); {
 		matched := false
@@ -236,7 +247,8 @@ func compileTemplate(raw string, p *compiledPattern) template {
 					if lit < i {
 						t.parts = append(t.parts, templatePart{literal: raw[lit:i], slot: -1})
 					}
-					t.parts = append(t.parts, templatePart{slot: tok.slot})
+					query := queryStart >= 0 && i > queryStart && i < queryEnd
+					t.parts = append(t.parts, templatePart{slot: tok.slot, query: query})
 					i += len(tok.text)
 					lit = i
 					matched = true
@@ -260,7 +272,9 @@ func (t template) dynamic() bool {
 }
 
 // expand substitutes captured values. With escape set, values are
-// percent-encoded for use in a URL.
+// percent-encoded for use in a URL: as a query component in the query
+// string, so that a value containing & or = can't add parameters, and as a
+// path segment elsewhere.
 func (t template) expand(values []string, splat string, escape bool) string {
 	if t.parts == nil {
 		return t.raw
@@ -271,6 +285,10 @@ func (t template) expand(values []string, splat string, escape bool) string {
 		switch {
 		case part.slot == -1:
 			b.WriteString(part.literal)
+		case escape && part.query && part.slot == splatSlot:
+			b.WriteString(url.QueryEscape(splat))
+		case escape && part.query:
+			b.WriteString(url.QueryEscape(values[part.slot]))
 		case part.slot == splatSlot && escape:
 			b.WriteString(escapeSplat(splat))
 		case part.slot == splatSlot:

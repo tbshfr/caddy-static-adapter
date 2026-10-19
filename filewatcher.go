@@ -161,8 +161,11 @@ func (fh *fileHandler) lookup(filePath string) *cachedFile {
 }
 
 // addFileLocked publishes a cache entry for filePath, evicting the least
-// recently checked entry when the cache is full. Must be called with fh.mu
-// held.
+// recently checked entry when the cache is full. Entries without rules (a
+// missing or rejected file) are evicted first, so requests for many
+// nonexistent roots, e.g. random Host headers with root /srv/{host}, can't
+// push out loaded rules and force them to be parsed again. Must be called
+// with fh.mu held.
 func (fh *fileHandler) addFileLocked(filePath string, f *cachedFile) {
 	var current map[string]*cachedFile
 	if files := fh.files.Load(); files != nil {
@@ -177,7 +180,7 @@ func (fh *fileHandler) addFileLocked(filePath string, f *cachedFile) {
 		var oldestPath string
 		var oldest *cachedFile
 		for p, e := range next {
-			if oldest == nil || e.lastCheck.Load() < oldest.lastCheck.Load() {
+			if oldest == nil || evictBefore(e, oldest) {
 				oldestPath, oldest = p, e
 			}
 		}
@@ -190,6 +193,14 @@ func (fh *fileHandler) addFileLocked(filePath string, f *cachedFile) {
 
 	next[filePath] = f
 	fh.files.Store(&next)
+}
+
+// evictBefore reports whether a should be evicted before b.
+func evictBefore(a, b *cachedFile) bool {
+	if aEmpty, bEmpty := a.get() == nil, b.get() == nil; aEmpty != bEmpty {
+		return aEmpty
+	}
+	return a.lastCheck.Load() < b.lastCheck.Load()
 }
 
 // refreshLocked stats filePath and reloads it when it changed since the

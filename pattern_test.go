@@ -102,6 +102,12 @@ func TestMatchHost(t *testing.T) {
 		// IPv6 with port — must not break.
 		{"::1", "[::1]:8080", true},
 		{"example.com", "[2001:db8::1]:8080", false},
+		{"::1", "[::1]", true},
+		{"2001:db8::1", "[2001:DB8:0::1]:443", true},
+
+		// IPv6 colons are not placeholders.
+		{"::1", "localhost", false},
+		{"::1", "[::2]", false},
 
 		// Placeholders in host.
 		{":sub.example.com", "foo.example.com", true},

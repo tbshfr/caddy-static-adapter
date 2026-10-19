@@ -14,7 +14,7 @@ import (
 // decoded paths (a rule for /café matches a request for /caf%C3%A9), and
 // absolute URL patterns are decoded to match (see splitURLPattern). Values
 // captured from the path are re-escaped before going into a redirect
-// destination (see template.expand).
+// destination or header value (see template.expand).
 func normalizePath(path string) string {
 	if path == "" {
 		return "/"
@@ -275,11 +275,13 @@ func (t template) dynamic() bool {
 	return t.parts != nil
 }
 
-// expand substitutes captured values. With escape set, values are
-// percent-encoded for use in a URL: as a query component in the query
-// string, so that a value containing & or = can't add parameters, and as a
-// path segment elsewhere.
-func (t template) expand(values []string, splat string, escape bool) string {
+// expand substitutes captured values, percent-encoded: as a query
+// component in the query string, so that a value containing & or = can't
+// add parameters, and as a path segment elsewhere. Besides keeping redirect
+// destinations on their host, this keeps a value from adding cookie
+// attributes (;) or list items (,) to a header, and reproduces the
+// still-encoded values Cloudflare inserts, as it matches undecoded paths.
+func (t template) expand(values []string, splat string) string {
 	if t.parts == nil {
 		return t.raw
 	}
@@ -289,18 +291,14 @@ func (t template) expand(values []string, splat string, escape bool) string {
 		switch {
 		case part.slot == -1:
 			b.WriteString(part.literal)
-		case escape && part.query && part.slot == splatSlot:
+		case part.query && part.slot == splatSlot:
 			b.WriteString(url.QueryEscape(splat))
-		case escape && part.query:
+		case part.query:
 			b.WriteString(url.QueryEscape(values[part.slot]))
-		case part.slot == splatSlot && escape:
-			b.WriteString(escapeSplat(splat))
 		case part.slot == splatSlot:
-			b.WriteString(splat)
-		case escape:
-			b.WriteString(url.PathEscape(values[part.slot]))
+			b.WriteString(escapeSplat(splat))
 		default:
-			b.WriteString(values[part.slot])
+			b.WriteString(url.PathEscape(values[part.slot]))
 		}
 	}
 	return b.String()
@@ -335,6 +333,12 @@ func matchHost(patternHost, requestHost string) bool {
 	// which correctly handles IPv6 addresses like [::1]:8080.
 	if h, _, err := net.SplitHostPort(requestHost); err == nil {
 		requestHost = h
+	}
+
+	// The colons of an IPv6 address would otherwise read as placeholders,
+	// letting https://[::1]/ match any host without a dot.
+	if ip := net.ParseIP(patternHost); ip != nil {
+		return ip.Equal(net.ParseIP(strings.TrimSuffix(strings.TrimPrefix(requestHost, "["), "]")))
 	}
 
 	if !strings.Contains(patternHost, ":") {

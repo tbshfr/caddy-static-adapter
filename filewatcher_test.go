@@ -619,3 +619,24 @@ func TestCheckOfEvictedEntryDoesNotResubscribe(t *testing.T) {
 		t.Errorf("expected no watch on the evicted root after Cleanup, got %d handlers", n)
 	}
 }
+
+func TestEvictionPrefersMissingFiles(t *testing.T) {
+	loaded := filepath.Join(t.TempDir(), "_redirects")
+	if err := os.WriteFile(loaded, []byte("/x /a 301\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := newTestRedirectHandler()
+	defer h.Cleanup()
+	h.getCached(loaded)
+	h.lookup(loaded).lastCheck.Store(0) // the least recently checked entry
+
+	base := t.TempDir()
+	for i := 0; i < 2*maxCachedFiles; i++ {
+		h.getCached(filepath.Join(base, fmt.Sprint(i), "_redirects"))
+	}
+
+	if h.cachedData(loaded) == nil {
+		t.Error("entries for missing files evicted the loaded rules")
+	}
+}

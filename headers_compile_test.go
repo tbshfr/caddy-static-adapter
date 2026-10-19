@@ -896,3 +896,28 @@ func TestSetCookieRemoveResetsWithinRule(t *testing.T) {
 		t.Errorf("want [b=2 c=3], got %q", got)
 	}
 }
+
+func TestHeaderValuesEscaped(t *testing.T) {
+	rules, _ := Parse(strings.NewReader(`/u/:name
+  Set-Cookie: user=:name; Path=/u; HttpOnly
+/s/*
+  Link: </static/:splat>; rel=preload
+  X-Search: /find?q=:splat
+`), 0, 0, 0)
+	c := Compile(rules)
+
+	headers := make(http.Header)
+	applyHeaders(headers, c.MatchOrdered("/u/x; Domain=.example.com", ""), false)
+	if got, want := headers.Get("Set-Cookie"), "user=x%3B%20Domain=.example.com; Path=/u; HttpOnly"; got != want {
+		t.Errorf("Set-Cookie: want %q, got %q", want, got)
+	}
+
+	headers = make(http.Header)
+	applyHeaders(headers, c.MatchOrdered("/s/a/b>; rel=x, <https://evil.example", ""), false)
+	if got, want := headers.Get("Link"), "</static/a/b%3E%3B%20rel=x%2C%20%3Chttps://evil.example>; rel=preload"; got != want {
+		t.Errorf("Link: want %q, got %q", want, got)
+	}
+	if got, want := headers.Get("X-Search"), "/find?q=a%2Fb%3E%3B+rel%3Dx%2C+%3Chttps%3A%2F%2Fevil.example"; got != want {
+		t.Errorf("X-Search: want %q, got %q", want, got)
+	}
+}

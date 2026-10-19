@@ -249,7 +249,7 @@ func expandOps(cr *compiledRule, ops compiledOps, path string) []HeaderOp {
 	expanded := make([]HeaderOp, len(ops.ops))
 	for i, op := range ops.ops {
 		expanded[i] = op
-		expanded[i].Value = ops.values[i].expand(values, splat, false)
+		expanded[i].Value = ops.values[i].expand(values, splat)
 	}
 	return expanded
 }

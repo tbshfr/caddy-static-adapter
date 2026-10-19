@@ -56,7 +56,7 @@ func (cr *compiledRedirect) expand(requestPath string) string {
 	if !ok {
 		return cr.To
 	}
-	to := cr.to.expand(values, splat, true)
+	to := cr.to.expand(values, splat)
 
 	// A destination like /:splat expanded from /go//evil.com becomes
 	// //evil.com, which browsers treat as protocol-relative. Only collapse

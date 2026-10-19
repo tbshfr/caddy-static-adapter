@@ -687,3 +687,51 @@ func TestServeHTTPIntegration(t *testing.T) {
 		})
 	}
 }
+
+func TestDedupKeepsRepeatedHeadersWithinRule(t *testing.T) {
+	input := `/*
+  Link: </a.css>; rel=preload
+  Link: </b.js>; rel=preload
+  Cache-Control: no-cache
+/blog/:slug
+  Cache-Control: public
+  Cache-Control: max-age=60
+  X-Slug: :slug
+  X-Slug: also-:slug
+`
+	rules, warnings := Parse(strings.NewReader(input), 0, 0, 0)
+	if len(warnings) > 0 {
+		t.Fatalf("unexpected warnings: %v", warnings)
+	}
+	compiled := Compile(rules)
+
+	headers := make(http.Header)
+	applyHeaders(headers, compiled.MatchBySpecificity("/blog/hello", ""), true)
+
+	if got, want := headers.Get("Link"), "</a.css>; rel=preload, </b.js>; rel=preload"; got != want {
+		t.Errorf("Link: want %q, got %q", want, got)
+	}
+	// /blog/:slug is more specific than /*, so its values replace the
+	// /* value but are still joined with each other.
+	if got, want := headers.Get("Cache-Control"), "public, max-age=60"; got != want {
+		t.Errorf("Cache-Control: want %q, got %q", want, got)
+	}
+	if got, want := headers.Get("X-Slug"), "hello, also-hello"; got != want {
+		t.Errorf("X-Slug: want %q, got %q", want, got)
+	}
+}
+
+func TestMergeRepeatedHeadersRemoveResets(t *testing.T) {
+	ops := []HeaderOp{
+		{Name: "X-A", Value: "1", Mode: OpSet},
+		{Name: "X-A", Value: "2", Mode: OpSet},
+		{Name: "X-A", Mode: OpRemove},
+		{Name: "X-A", Value: "3", Mode: OpSet},
+		{Name: "X-A", Value: "4", Mode: OpSet},
+	}
+	headers := make(http.Header)
+	applyHeaders(headers, mergeRepeatedHeaders(ops), true)
+	if got, want := headers.Get("X-A"), "3, 4"; got != want {
+		t.Errorf("want %q, got %q", want, got)
+	}
+}

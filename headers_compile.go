@@ -22,6 +22,10 @@ type compiledRule struct {
 	// splat patterns it is the length of the prefix before the '*';
 	// for placeholder patterns it is the count of literal segments.
 	specificity int
+
+	// dedupOps is Ops with repeated headers comma-joined, used in dedup
+	// mode so that "last wins" only applies across rules, not within one.
+	dedupOps []HeaderOp
 }
 
 // indexedRule pairs a compiledRule with its original position in the file,
@@ -89,6 +93,7 @@ func Compile(rules []*Rule) *Compiled {
 		}
 		// Compute specificity for dedup ordering.
 		cr.specificity = computeSpecificity(cr)
+		cr.dedupOps = mergeRepeatedHeaders(rule.Ops)
 
 		ir := indexedRule{index: i, cr: cr}
 
@@ -144,7 +149,7 @@ func (c *Compiled) MatchOrdered(requestPath, requestHost string) []HeaderOp {
 				continue
 			}
 			if matchPattern(ir.cr.pathPattern, requestPath) {
-				ops = append(ops, expandOps(ir.cr, requestPath)...)
+				ops = append(ops, expandOps(ir.cr, ir.cr.Ops, requestPath)...)
 			}
 		}
 	}
@@ -186,7 +191,7 @@ func (c *Compiled) MatchBySpecificity(requestPath, requestHost string) []HeaderO
 
 	var ops []HeaderOp
 	for _, ir := range matched {
-		ops = append(ops, expandOps(ir.cr, requestPath)...)
+		ops = append(ops, expandOps(ir.cr, ir.cr.dedupOps, requestPath)...)
 	}
 	return ops
 }
@@ -211,7 +216,7 @@ func matchWildcardOnly(wildcards []indexedRule, requestPath, requestHost string)
 			continue
 		}
 		if matchPattern(ir.cr.pathPattern, requestPath) {
-			ops = append(ops, expandOps(ir.cr, requestPath)...)
+			ops = append(ops, expandOps(ir.cr, ir.cr.Ops, requestPath)...)
 		}
 	}
 	return ops
@@ -248,10 +253,11 @@ func computeSpecificity(cr *compiledRule) int {
 	return count
 }
 
-// expandOps expands placeholder references in header operation values.
-func expandOps(cr *compiledRule, path string) []HeaderOp {
+// expandOps expands placeholder references in the values of ops, which
+// must be cr.Ops or cr.dedupOps.
+func expandOps(cr *compiledRule, ops []HeaderOp, path string) []HeaderOp {
 	if !cr.needsSplat && !cr.needsPlaceholders {
-		return cr.Ops
+		return ops
 	}
 
 	// Extract splat value if pattern has wildcard.
@@ -273,8 +279,8 @@ func expandOps(cr *compiledRule, path string) []HeaderOp {
 		placeholders, _ = extractPlaceholders(cr.pathPattern, path)
 	}
 
-	expanded := make([]HeaderOp, len(cr.Ops))
-	for i, op := range cr.Ops {
+	expanded := make([]HeaderOp, len(ops))
+	for i, op := range ops {
 		expanded[i] = op
 		if strings.Contains(op.Value, ":") {
 			val := op.Value
@@ -294,4 +300,25 @@ func expandOps(cr *compiledRule, path string) []HeaderOp {
 	}
 
 	return expanded
+}
+
+// mergeRepeatedHeaders comma-joins repeated sets of the same header within
+// one rule. A remove resets the header, so a set after it starts a new value.
+func mergeRepeatedHeaders(ops []HeaderOp) []HeaderOp {
+	merged := make([]HeaderOp, 0, len(ops))
+	current := make(map[string]int) // header name → index of its set in merged
+	for _, op := range ops {
+		if op.Mode == OpRemove {
+			delete(current, op.Name)
+			merged = append(merged, op)
+			continue
+		}
+		if i, ok := current[op.Name]; ok {
+			merged[i].Value += ", " + op.Value
+			continue
+		}
+		current[op.Name] = len(merged)
+		merged = append(merged, op)
+	}
+	return merged
 }

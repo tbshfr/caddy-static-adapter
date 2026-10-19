@@ -1,6 +1,7 @@
 package staticadapter
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.uber.org/zap"
 )
@@ -359,5 +361,49 @@ func TestRedirectStrictModeIgnores404(t *testing.T) {
 	// Only the two valid redirect rules should be loaded.
 	if rules.totalRules() != 2 {
 		t.Fatalf("expected 2 rules, got %d", rules.totalRules())
+	}
+}
+
+func TestRedirectExpansionCannotChangeHost(t *testing.T) {
+	dir := t.TempDir()
+	rules := "/go/* /:splat 301\n" +
+		"/p/:name /:name 301\n" +
+		"/to/:site https://:site.example.com/ 301\n" +
+		"/old/* /new/:splat 301\n" +
+		"/cdn/* //cdn.example.com/:splat 301\n"
+	if err := os.WriteFile(filepath.Join(dir, "_redirects"), []byte(rules), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	h := newTestRedirectHandler()
+	defer h.Cleanup()
+
+	tests := []struct {
+		path string
+		want string
+	}{
+		{"/go//evil.com", "/evil.com"},
+		{"/go/%5Cevil.com", "/%5Cevil.com"},
+		{"/p/%5Cevil.com", "/%5Cevil.com"},
+		{"/to/evil.com%23", "https://evil.com%23.example.com/"},
+		{"/old/a%3Fb", "/new/a%3Fb"},
+		{"/old/a%20b/c", "/new/a%20b/c"},
+		{"/cdn/app.js", "//cdn.example.com/app.js"},
+	}
+
+	for _, tt := range tests {
+		req := httptest.NewRequest("GET", tt.path, nil)
+		repl := caddy.NewReplacer()
+		repl.Set("http.vars.root", dir)
+		req = req.WithContext(context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl))
+		rec := httptest.NewRecorder()
+
+		next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error { return nil })
+		if err := h.ServeHTTP(rec, req, next); err != nil {
+			t.Fatalf("path %q: unexpected error: %v", tt.path, err)
+		}
+		if got := rec.Header().Get("Location"); got != tt.want {
+			t.Errorf("path %q: expected Location %q, got %q", tt.path, tt.want, got)
+		}
 	}
 }

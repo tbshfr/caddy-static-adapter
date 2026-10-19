@@ -2,6 +2,7 @@ package staticadapter
 
 import (
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -215,10 +216,16 @@ func matchRedirect(cr *compiledRedirect, requestPath string) bool {
 }
 
 // expandRedirectTo expands placeholders and :splat in the redirect destination.
+//
+// requestPath is the decoded r.URL.Path, so expanded values are re-escaped
+// before insertion. Otherwise a request like /go/%5Cevil.com or /to/evil.com%23
+// would put a literal \ or # into the Location header and send the client to
+// another host.
 func expandRedirectTo(pattern, to, requestPath string) string {
 	if !strings.Contains(to, ":") {
 		return to
 	}
+	original := to
 
 	// Extract splat value if pattern has wildcard.
 	if idx := strings.Index(pattern, "*"); idx >= 0 {
@@ -228,17 +235,35 @@ func expandRedirectTo(pattern, to, requestPath string) string {
 		if suffix != "" {
 			remaining = strings.TrimSuffix(remaining, suffix)
 		}
-		to = strings.ReplaceAll(to, ":splat", remaining)
+		to = strings.ReplaceAll(to, ":splat", escapeSplat(remaining))
 	}
 
 	// Extract placeholder values.
 	if placeholders, ok := extractPlaceholders(pattern, requestPath); ok {
 		for name, val := range placeholders {
-			to = strings.ReplaceAll(to, ":"+name, val)
+			to = strings.ReplaceAll(to, ":"+name, url.PathEscape(val))
 		}
 	}
 
+	// A destination like /:splat expanded from /go//evil.com becomes
+	// //evil.com, which browsers treat as protocol-relative. Only collapse
+	// when expansion introduced it, so an explicit //host destination in
+	// the _redirects file keeps working.
+	if strings.HasPrefix(to, "//") && !strings.HasPrefix(original, "//") {
+		to = "/" + strings.TrimLeft(to, "/")
+	}
+
 	return to
+}
+
+// escapeSplat percent-encodes each segment of a splat value while keeping
+// the '/' separators intact.
+func escapeSplat(splat string) string {
+	segments := strings.Split(splat, "/")
+	for i, s := range segments {
+		segments[i] = url.PathEscape(s)
+	}
+	return strings.Join(segments, "/")
 }
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.

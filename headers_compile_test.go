@@ -768,3 +768,60 @@ func TestParsePlaceholderSharingSegmentWithSplatRejected(t *testing.T) {
 		t.Fatalf("expected pattern to be rejected, got %d rules, warnings %v", len(rules), warnings)
 	}
 }
+
+func TestDedupSpecificityComparesPatternKinds(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		path  string
+		want  string
+	}{
+		{
+			name:  "placeholder with longer literal beats short splat",
+			input: "/blog/:slug\n  X-Rule: placeholder\n/b*\n  X-Rule: splat\n",
+			path:  "/blog/hello",
+			want:  "placeholder",
+		},
+		{
+			name:  "longer splat prefix beats placeholder",
+			input: "/:section/x\n  X-Rule: placeholder\n/docs/guide/*\n  X-Rule: splat\n",
+			path:  "/docs/guide/x",
+			want:  "splat",
+		},
+		{
+			name:  "placeholder beats splat at equal literal length",
+			input: "/blog/:slug\n  X-Rule: placeholder\n/blog/*\n  X-Rule: splat\n",
+			path:  "/blog/hello",
+			want:  "placeholder",
+		},
+		{
+			name:  "mixed pattern scored by its literal characters",
+			input: "/:lang/docs/*\n  X-Rule: mixed\n/*\n  X-Rule: catch-all\n",
+			path:  "/en/docs/intro",
+			want:  "mixed",
+		},
+		{
+			name:  "exact beats placeholder",
+			input: "/blog/hello\n  X-Rule: exact\n/blog/:slug\n  X-Rule: placeholder\n",
+			path:  "/blog/hello",
+			want:  "exact",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rules, warnings := Parse(strings.NewReader(tt.input), 0, 0, 0)
+			if len(warnings) != 0 {
+				t.Fatalf("unexpected warnings: %v", warnings)
+			}
+			// Both file orders must give the same result.
+			for _, order := range [][]*Rule{rules, {rules[1], rules[0]}} {
+				headers := make(http.Header)
+				applyHeaders(headers, Compile(order).MatchBySpecificity(tt.path, ""), true)
+				if got := headers.Get("X-Rule"); got != tt.want {
+					t.Errorf("first rule %q: want %q, got %q", order[0].Pattern, tt.want, got)
+				}
+			}
+		})
+	}
+}

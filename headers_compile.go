@@ -18,9 +18,7 @@ type compiledRule struct {
 	needsPlaceholders bool
 
 	// specificity measures how specific the pattern is. Higher values
-	// mean more specific. For exact matches this is math.MaxInt; for
-	// splat patterns it is the length of the prefix before the '*';
-	// for placeholder patterns it is the count of literal segments.
+	// mean more specific. See computeSpecificity.
 	specificity int
 
 	// dedupOps is Ops with repeated headers comma-joined, used in dedup
@@ -232,25 +230,32 @@ func (c *Compiled) totalRules() int {
 }
 
 // computeSpecificity returns the specificity score for a compiled rule.
-// Exact matches get the highest score (math.MaxInt). Splat patterns
-// are scored by the length of the fixed prefix before the '*'. Placeholder
-// patterns are scored by the number of literal (non-placeholder) path segments.
+// Exact matches get the highest score (math.MaxInt). All other patterns are
+// scored on one scale, by their number of literal characters (everything
+// except placeholders and the '*'), so that e.g. /blog/:slug beats /b*.
+// At equal length a pattern without a splat wins, since a placeholder
+// matches a single segment while '*' matches anything.
 func computeSpecificity(cr *compiledRule) int {
 	if !cr.hasSplat && len(cr.placeholderTokens) == 0 {
 		// Exact match — highest specificity.
 		return math.MaxInt
 	}
+
+	literal := len(cr.pathPattern)
 	if cr.hasSplat {
-		return strings.Index(cr.pathPattern, "*")
+		literal--
 	}
-	// Placeholder pattern: count literal segments.
-	count := 0
 	for _, part := range strings.Split(cr.pathPattern, "/") {
-		if part != "" && !strings.HasPrefix(part, ":") {
-			count++
+		if strings.HasPrefix(part, ":") && len(part) > 1 {
+			literal -= len(part)
 		}
 	}
-	return count
+
+	score := literal * 2
+	if !cr.hasSplat {
+		score++
+	}
+	return score
 }
 
 // expandOps expands placeholder references in the values of ops, which

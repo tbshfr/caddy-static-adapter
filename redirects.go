@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
@@ -227,6 +228,9 @@ func expandRedirectTo(pattern, to, requestPath string) string {
 	}
 	original := to
 
+	type replacement struct{ token, value string }
+	var replacements []replacement
+
 	// Extract splat value if pattern has wildcard.
 	if idx := strings.Index(pattern, "*"); idx >= 0 {
 		prefix := pattern[:idx]
@@ -235,15 +239,31 @@ func expandRedirectTo(pattern, to, requestPath string) string {
 		if suffix != "" {
 			remaining = strings.TrimSuffix(remaining, suffix)
 		}
-		to = strings.ReplaceAll(to, ":splat", escapeSplat(remaining))
+		replacements = append(replacements, replacement{":splat", escapeSplat(remaining)})
 	}
 
 	// Extract placeholder values.
 	if placeholders, ok := extractPlaceholders(pattern, requestPath); ok {
 		for name, val := range placeholders {
-			to = strings.ReplaceAll(to, ":"+name, url.PathEscape(val))
+			replacements = append(replacements, replacement{":" + name, url.PathEscape(val)})
 		}
 	}
+
+	if len(replacements) == 0 {
+		return to
+	}
+
+	// strings.Replacer tries tokens in argument order at each position, so
+	// longer tokens must come first or :id would match inside :idx. Its single
+	// pass also keeps a value containing ":name" from being expanded again.
+	sort.Slice(replacements, func(i, j int) bool {
+		return len(replacements[i].token) > len(replacements[j].token)
+	})
+	oldnew := make([]string, 0, 2*len(replacements))
+	for _, r := range replacements {
+		oldnew = append(oldnew, r.token, r.value)
+	}
+	to = strings.NewReplacer(oldnew...).Replace(to)
 
 	// A destination like /:splat expanded from /go//evil.com becomes
 	// //evil.com, which browsers treat as protocol-relative. Only collapse

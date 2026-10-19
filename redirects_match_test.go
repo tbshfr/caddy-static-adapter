@@ -253,3 +253,22 @@ func TestRedirectMatch404RuleSkipped(t *testing.T) {
 		t.Error("expected no match for /anything-else (404 rule should be skipped)")
 	}
 }
+
+func TestExpandRedirectToPlaceholderPrefixes(t *testing.T) {
+	// Repeat to catch map iteration order dependence.
+	for i := 0; i < 50; i++ {
+		to := expandRedirectTo("/p/:id/:idx", "/item?a=:id&b=:idx", "/p/AAA/BBB")
+		if to != "/item?a=AAA&b=BBB" {
+			t.Fatalf("iteration %d: expected /item?a=AAA&b=BBB, got %s", i, to)
+		}
+	}
+}
+
+func TestExpandRedirectToValuesNotReexpanded(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		to := expandRedirectTo("/p/:a/:b", "/x/:a/:b", "/p/:b/real")
+		if to != "/x/:b/real" {
+			t.Fatalf("iteration %d: expected /x/:b/real, got %s", i, to)
+		}
+	}
+}

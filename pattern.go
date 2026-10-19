@@ -10,7 +10,11 @@ import (
 )
 
 // normalizePath ensures a URL path has a leading slash for consistent matching.
-// No percent-decoding is performed — we match on the raw path as Cloudflare does.
+// Handlers pass the already percent-decoded r.URL.Path, so rules match
+// decoded paths (a rule for /café matches a request for /caf%C3%A9), and
+// absolute URL patterns are decoded to match (see splitURLPattern). Values
+// captured from the path are re-escaped before going into a redirect
+// destination (see template.expand).
 func normalizePath(path string) string {
 	if path == "" {
 		return "/"

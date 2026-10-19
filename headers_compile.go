@@ -256,6 +256,8 @@ func expandOps(cr *compiledRule, ops compiledOps, path string) []HeaderOp {
 
 // mergeRepeatedHeaders comma-joins repeated sets of the same header within
 // one rule. A remove resets the header, so a set after it starts a new value.
+// Headers that must not be comma-joined keep one op per value, with every
+// value after the first turned into an append.
 func mergeRepeatedHeaders(ops []HeaderOp) []HeaderOp {
 	merged := make([]HeaderOp, 0, len(ops))
 	current := make(map[string]int) // header name → index of its set in merged
@@ -266,6 +268,11 @@ func mergeRepeatedHeaders(ops []HeaderOp) []HeaderOp {
 			continue
 		}
 		if i, ok := current[op.Name]; ok {
+			if noCommaJoin(op.Name) {
+				op.Mode = opAppend
+				merged = append(merged, op)
+				continue
+			}
 			merged[i].Value += ", " + op.Value
 			continue
 		}

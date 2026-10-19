@@ -125,12 +125,16 @@ func (h *Handler) loadFile(filePath string) (any, error) {
 // "last wins" semantics (overwrite) instead of comma-joining. This is
 // useful for _headers files with overlapping wildcard rules that set the
 // same header at different specificity levels.
+//
+// Set-Cookie is never comma-joined: each value becomes its own header line.
 func applyHeaders(headers http.Header, ops []HeaderOp, dedup bool) {
 	for _, op := range ops {
 		switch op.Mode {
 		case OpSet:
 			if dedup {
 				headers.Set(op.Name, op.Value)
+			} else if noCommaJoin(op.Name) {
+				headers.Add(op.Name, op.Value)
 			} else {
 				existing := headers.Get(op.Name)
 				if existing == "" {
@@ -141,6 +145,8 @@ func applyHeaders(headers http.Header, ops []HeaderOp, dedup bool) {
 			}
 		case OpRemove:
 			headers.Del(op.Name)
+		case opAppend:
+			headers.Add(op.Name, op.Value)
 		}
 	}
 }

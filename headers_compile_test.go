@@ -853,3 +853,46 @@ func TestLiteralColonPatternIsExact(t *testing.T) {
 		t.Errorf("expected /a:b to match itself, got %v", ops)
 	}
 }
+
+func TestSetCookieNeverCommaJoined(t *testing.T) {
+	input := `/*
+  Set-Cookie: site=1; Path=/
+/account/*
+  Set-Cookie: a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT
+  Set-Cookie: b=2
+`
+	rules, warnings := Parse(strings.NewReader(input), 0, 0, 0)
+	if len(warnings) != 0 {
+		t.Fatalf("unexpected warnings: %v", warnings)
+	}
+	c := Compile(rules)
+
+	headers := make(http.Header)
+	applyHeaders(headers, c.MatchOrdered("/account/x", ""), false)
+	want := []string{"site=1; Path=/", "a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT", "b=2"}
+	if got := headers.Values("Set-Cookie"); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("without dedup: want %q, got %q", want, got)
+	}
+
+	// With dedup the more specific rule replaces /* but keeps both of its cookies.
+	headers = make(http.Header)
+	applyHeaders(headers, c.MatchBySpecificity("/account/x", ""), true)
+	want = []string{"a=1; Expires=Wed, 21 Oct 2026 07:28:00 GMT", "b=2"}
+	if got := headers.Values("Set-Cookie"); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("with dedup: want %q, got %q", want, got)
+	}
+}
+
+func TestSetCookieRemoveResetsWithinRule(t *testing.T) {
+	ops := []HeaderOp{
+		{Name: "Set-Cookie", Value: "a=1", Mode: OpSet},
+		{Name: "Set-Cookie", Mode: OpRemove},
+		{Name: "Set-Cookie", Value: "b=2", Mode: OpSet},
+		{Name: "Set-Cookie", Value: "c=3", Mode: OpSet},
+	}
+	headers := http.Header{"Set-Cookie": {"upstream=1"}}
+	applyHeaders(headers, mergeRepeatedHeaders(ops), true)
+	if got := headers.Values("Set-Cookie"); strings.Join(got, "|") != "b=2|c=3" {
+		t.Errorf("want [b=2 c=3], got %q", got)
+	}
+}

@@ -63,7 +63,7 @@ Place a `_headers` file in your site root. Format follows the [Cloudflare Pages 
 
 Each block starts with an unindented URL pattern, followed by indented header lines:
 
-- `Name: value` — sets a header. If the same header matches from multiple rules, values are comma-joined (Cloudflare semantics).
+- `Name: value` — sets a header. If the same header matches from multiple rules, values are comma-joined (Cloudflare semantics), except `Set-Cookie`, which is sent as separate header lines.
 - `! Name` — removes a header entirely.
 - `#` lines are comments.
 - `*` is a wildcard (greedy, one per pattern). Use `:splat` in values to reference what it matched.

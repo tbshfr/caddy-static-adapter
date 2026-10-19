@@ -23,7 +23,19 @@ const (
 	OpSet OpMode = iota
 	// OpRemove removes a header.
 	OpRemove
+
+	// opAppend adds another value as a separate header line. It is only
+	// produced by mergeRepeatedHeaders for headers that must not be
+	// comma-joined (see noCommaJoin).
+	opAppend
 )
+
+// noCommaJoin reports whether repeated values of the header must be sent as
+// separate header lines instead of one comma-joined line. Set-Cookie is the
+// exception RFC 9110 section 5.3 names: cookie values may contain commas.
+func noCommaJoin(name string) bool {
+	return name == "Set-Cookie"
+}
 
 // HeaderOp represents a single header operation parsed from a _headers file.
 type HeaderOp struct {

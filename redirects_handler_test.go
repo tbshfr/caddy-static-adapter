@@ -134,10 +134,7 @@ func TestGetCompiledRedirectsReloadsOnChange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Reset lastCheck to force re-check.
-	h.mu.Lock()
-	h.lastCheck = time.Time{}
-	h.mu.Unlock()
+	h.expireCache()
 
 	rules = h.getCompiledRedirects(redirectsFile)
 	if rules == nil || rules.totalRules() != 1 {
@@ -177,10 +174,7 @@ func TestGetCompiledRedirectsFileAppears(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Reset lastCheck to force re-check.
-	h.mu.Lock()
-	h.lastCheck = time.Time{}
-	h.mu.Unlock()
+	h.expireCache()
 
 	rules = h.getCompiledRedirects(redirectsFile)
 	if rules == nil || rules.totalRules() != 1 {

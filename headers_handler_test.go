@@ -72,10 +72,7 @@ func TestGetCompiledReloadsOnChange(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Reset lastCheck to force re-check.
-	h.mu.Lock()
-	h.lastCheck = time.Time{}
-	h.mu.Unlock()
+	h.expireCache()
 
 	// Should pick up the new file.
 	compiled = h.getCompiled(headersFile)
@@ -116,10 +113,7 @@ func TestGetCompiledFileAppears(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Reset lastCheck to force re-check.
-	h.mu.Lock()
-	h.lastCheck = time.Time{}
-	h.mu.Unlock()
+	h.expireCache()
 
 	// Should pick it up now.
 	compiled = h.getCompiled(headersFile)
@@ -191,11 +185,6 @@ func TestGetCompiledDifferentFilesSameModTime(t *testing.T) {
 	if len(ops1) != 1 || ops1[0].Value != "file1" {
 		t.Fatalf("expected 'file1' headers, got %v", ops1)
 	}
-
-	// Reset lastCheck to force a re-check before switching to the second file.
-	h.mu.Lock()
-	h.lastCheck = time.Time{}
-	h.mu.Unlock()
 
 	// Now compile headers from the second file and ensure we don't get the first file's rules.
 	compiled2 := h.getCompiled(headersFile2)
@@ -333,9 +322,7 @@ func TestWatcherProactiveReload(t *testing.T) {
 	// Wait for the watcher to proactively reload — no getCompiled call.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		h.mu.RLock()
-		c, _ := h.cached.(*Compiled)
-		h.mu.RUnlock()
+		c, _ := h.cachedData(headersFile).(*Compiled)
 		if c != nil {
 			ops := c.MatchOrdered("/page", "")
 			if len(ops) == 1 && ops[0].Value == "value2" {
@@ -389,9 +376,7 @@ func TestWatcherDebounce(t *testing.T) {
 	// Wait for debounce + reload to complete.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		h.mu.RLock()
-		c, _ := h.cached.(*Compiled)
-		h.mu.RUnlock()
+		c, _ := h.cachedData(headersFile).(*Compiled)
 		if c != nil {
 			ops := c.MatchOrdered("/page", "")
 			if len(ops) == 1 && ops[0].Value == "value2" {

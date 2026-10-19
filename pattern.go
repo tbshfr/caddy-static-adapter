@@ -1,6 +1,7 @@
 package staticadapter
 
 import (
+	"fmt"
 	"net"
 	"net/url"
 	"strings"
@@ -30,6 +31,10 @@ func hasWildcardOrPlaceholder(pattern string) bool {
 func matchPattern(pattern, path string) bool {
 	// Handle splat wildcard.
 	if strings.Contains(pattern, "*") {
+		if strings.Contains(pattern, "/:") {
+			_, _, ok := capturePattern(pattern, path)
+			return ok
+		}
 		return matchSplat(pattern, path)
 	}
 
@@ -92,6 +97,88 @@ func extractPlaceholders(pattern, path string) (map[string]string, bool) {
 	}
 
 	return result, true
+}
+
+// capturePattern matches path against pattern and returns the values of its
+// named placeholders and its splat. Unlike matchSplat and
+// extractPlaceholders it supports patterns that combine both, such as
+// /:lang/docs/* or /*/:file.
+//
+// Segments before the '*' are matched from the start of the path and
+// segments after it from the end; the splat is whatever lies in between.
+func capturePattern(pattern, path string) (placeholders map[string]string, splat string, ok bool) {
+	star := strings.IndexByte(pattern, '*')
+	if star < 0 {
+		placeholders, ok = extractPlaceholders(pattern, path)
+		return placeholders, "", ok
+	}
+
+	pathSegs := strings.Split(path, "/")
+	prefixSegs := strings.Split(pattern[:star], "/")
+	suffixSegs := strings.Split(pattern[star+1:], "/")
+
+	// The splat starts inside path segment first and ends inside path segment last.
+	first := len(prefixSegs) - 1
+	last := len(pathSegs) - len(suffixSegs)
+	if first > last {
+		return nil, "", false
+	}
+
+	capture := func(patternSeg, pathSeg string) bool {
+		if !strings.HasPrefix(patternSeg, ":") {
+			return patternSeg == pathSeg
+		}
+		if len(patternSeg) == 1 {
+			return false
+		}
+		if placeholders == nil {
+			placeholders = make(map[string]string)
+		}
+		placeholders[patternSeg[1:]] = pathSeg
+		return true
+	}
+
+	start := 0
+	for i, seg := range prefixSegs[:first] {
+		if !capture(seg, pathSegs[i]) {
+			return nil, "", false
+		}
+		start += len(pathSegs[i]) + 1
+	}
+
+	end := len(path)
+	for i, seg := range suffixSegs[1:] {
+		pathSeg := pathSegs[last+1+i]
+		if !capture(seg, pathSeg) {
+			return nil, "", false
+		}
+		end -= len(pathSeg) + 1
+	}
+
+	// Literal text directly around the '*', e.g. "img-" and ".jpg" in /img-*.jpg.
+	before, after := prefixSegs[first], suffixSegs[0]
+	if !strings.HasPrefix(pathSegs[first], before) || !strings.HasSuffix(pathSegs[last], after) {
+		return nil, "", false
+	}
+	start += len(before)
+	end -= len(after)
+	if start > end {
+		return nil, "", false
+	}
+
+	return placeholders, path[start:end], true
+}
+
+// validatePlaceholderSegments reports an error when a placeholder shares a
+// path segment with the splat (e.g. /:lang*), which can't be matched
+// unambiguously.
+func validatePlaceholderSegments(pattern string, lineNum int) error {
+	for _, seg := range strings.Split(pattern, "/") {
+		if strings.HasPrefix(seg, ":") && strings.Contains(seg, "*") {
+			return &ParseError{Line: lineNum, Message: fmt.Sprintf("placeholder and wildcard (*) must be in separate path segments: %q", seg)}
+		}
+	}
+	return nil
 }
 
 // matchHost checks if a request host matches a pattern host.

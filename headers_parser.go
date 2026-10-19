@@ -193,6 +193,10 @@ func validatePattern(pattern string, lineNum int) error {
 		return &ParseError{Line: lineNum, Message: "only one wildcard (*) allowed per pattern"}
 	}
 
+	if err := validatePlaceholderSegments(pattern, lineNum); err != nil {
+		return err
+	}
+
 	// Check for CRLF in pattern.
 	if strings.ContainsAny(pattern, "\r\n") {
 		return &ParseError{Line: lineNum, Message: "pattern contains invalid characters"}

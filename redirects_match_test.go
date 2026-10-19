@@ -272,3 +272,33 @@ func TestExpandRedirectToValuesNotReexpanded(t *testing.T) {
 		}
 	}
 }
+
+func TestRedirectMixedPlaceholderAndSplat(t *testing.T) {
+	rules, warnings := ParseRedirects(strings.NewReader("/:lang/docs/* /docs/:lang/:splat 301\n"), 0, 0, 0)
+	if len(warnings) != 0 {
+		t.Fatalf("unexpected warnings: %v", warnings)
+	}
+	compiled := make([]*compiledRedirect, len(rules))
+	for i, r := range rules {
+		compiled[i] = &compiledRedirect{RedirectRule: r, pathPattern: r.From}
+	}
+	cr := compileRedirects(compiled)
+
+	match := cr.MatchFirst("/en/docs/intro/setup")
+	if match == nil {
+		t.Fatal("expected match for /en/docs/intro/setup")
+	}
+	if to := expandRedirectTo(match.pathPattern, match.To, "/en/docs/intro/setup"); to != "/docs/en/intro/setup" {
+		t.Errorf("expected /docs/en/intro/setup, got %s", to)
+	}
+	if cr.MatchFirst("/en/blog/intro") != nil {
+		t.Error("expected no match for /en/blog/intro")
+	}
+}
+
+func TestRedirectPlaceholderSharingSegmentWithSplatRejected(t *testing.T) {
+	rules, warnings := ParseRedirects(strings.NewReader("/:lang* /x 301\n"), 0, 0, 0)
+	if len(rules) != 0 || len(warnings) != 1 {
+		t.Fatalf("expected rule to be rejected with 1 warning, got %d rules, warnings %v", len(rules), warnings)
+	}
+}

@@ -228,25 +228,18 @@ func expandRedirectTo(pattern, to, requestPath string) string {
 	}
 	original := to
 
-	type replacement struct{ token, value string }
-	var replacements []replacement
-
-	// Extract splat value if pattern has wildcard.
-	if idx := strings.Index(pattern, "*"); idx >= 0 {
-		prefix := pattern[:idx]
-		suffix := pattern[idx+1:]
-		remaining := requestPath[len(prefix):]
-		if suffix != "" {
-			remaining = strings.TrimSuffix(remaining, suffix)
-		}
-		replacements = append(replacements, replacement{":splat", escapeSplat(remaining)})
+	placeholders, splat, ok := capturePattern(pattern, requestPath)
+	if !ok {
+		return to
 	}
 
-	// Extract placeholder values.
-	if placeholders, ok := extractPlaceholders(pattern, requestPath); ok {
-		for name, val := range placeholders {
-			replacements = append(replacements, replacement{":" + name, url.PathEscape(val)})
-		}
+	type replacement struct{ token, value string }
+	var replacements []replacement
+	if strings.Contains(pattern, "*") {
+		replacements = append(replacements, replacement{":splat", escapeSplat(splat)})
+	}
+	for name, val := range placeholders {
+		replacements = append(replacements, replacement{":" + name, url.PathEscape(val)})
 	}
 
 	if len(replacements) == 0 {

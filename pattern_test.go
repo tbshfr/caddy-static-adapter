@@ -1,6 +1,9 @@
 package staticadapter
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // ---------- Normalize Path Tests ----------
 
@@ -145,6 +148,82 @@ func TestMatchPattern(t *testing.T) {
 		got := matchPattern(tt.pattern, tt.path)
 		if got != tt.want {
 			t.Errorf("matchPattern(%q, %q) = %v, want %v", tt.pattern, tt.path, got, tt.want)
+		}
+	}
+}
+
+// ---------- Capture Pattern Tests ----------
+
+func TestCapturePattern(t *testing.T) {
+	tests := []struct {
+		pattern      string
+		path         string
+		ok           bool
+		splat        string
+		placeholders map[string]string
+	}{
+		{"/:lang/docs/*", "/en/docs/intro/setup", true, "intro/setup", map[string]string{"lang": "en"}},
+		{"/:lang/docs/*", "/en/docs/", true, "", map[string]string{"lang": "en"}},
+		{"/:lang/docs/*", "/en/blog/intro", false, "", nil},
+		{"/:lang/docs/*", "/en/docs", false, "", nil},
+		{"/*/:file", "/a/b/c.txt", true, "a/b", map[string]string{"file": "c.txt"}},
+		{"/:a/*/:b", "/x/m/n/y", true, "m/n", map[string]string{"a": "x", "b": "y"}},
+		{"/:a/*/:b", "/x/y", false, "", nil},
+		{"/:lang/img-*.jpg", "/de/img-cat.jpg", true, "cat", map[string]string{"lang": "de"}},
+		{"/:lang/img-*.jpg", "/de/img-cat.png", false, "", nil},
+		{"/:/docs/*", "/en/docs/x", false, "", nil},
+		{"/movies/:title", "/movies/up", true, "", map[string]string{"title": "up"}},
+	}
+
+	for _, tt := range tests {
+		placeholders, splat, ok := capturePattern(tt.pattern, tt.path)
+		if ok != tt.ok {
+			t.Errorf("capturePattern(%q, %q) ok = %v, want %v", tt.pattern, tt.path, ok, tt.ok)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if splat != tt.splat {
+			t.Errorf("capturePattern(%q, %q) splat = %q, want %q", tt.pattern, tt.path, splat, tt.splat)
+		}
+		if len(placeholders) != len(tt.placeholders) {
+			t.Errorf("capturePattern(%q, %q) placeholders = %v, want %v", tt.pattern, tt.path, placeholders, tt.placeholders)
+			continue
+		}
+		for k, v := range tt.placeholders {
+			if placeholders[k] != v {
+				t.Errorf("capturePattern(%q, %q) placeholder %q = %q, want %q", tt.pattern, tt.path, k, placeholders[k], v)
+			}
+		}
+		if got := matchPattern(tt.pattern, tt.path); got != tt.ok {
+			t.Errorf("matchPattern(%q, %q) = %v, want %v", tt.pattern, tt.path, got, tt.ok)
+		}
+	}
+}
+
+// capturePattern must agree with matchSplat on patterns without placeholders.
+func TestCapturePatternMatchesSplat(t *testing.T) {
+	patterns := []string{"/*", "/blog/*", "/*.jpg", "/img-*.jpg", "/a*a", "/*/edit", "/static/*/x.js"}
+	paths := []string{"/", "/a", "/aa", "/blog", "/blog/", "/blog/a/b", "/x.jpg", "/a/b.jpg",
+		"/img-.jpg", "/img-cat.jpg", "/p/edit", "/p/q/edit", "/edit", "/static/v1/x.js", "/static/x.js"}
+
+	for _, pattern := range patterns {
+		for _, path := range paths {
+			want := matchSplat(pattern, path)
+			_, splat, got := capturePattern(pattern, path)
+			if got != want {
+				t.Errorf("pattern %q path %q: capturePattern ok = %v, matchSplat = %v", pattern, path, got, want)
+				continue
+			}
+			if !got {
+				continue
+			}
+			star := strings.Index(pattern, "*")
+			wantSplat := strings.TrimSuffix(path[star:], pattern[star+1:])
+			if splat != wantSplat {
+				t.Errorf("pattern %q path %q: splat = %q, want %q", pattern, path, splat, wantSplat)
+			}
 		}
 	}
 }

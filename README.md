@@ -67,7 +67,7 @@ Each block starts with an unindented URL pattern, followed by indented header li
 - `! Name` — removes a header entirely.
 - `#` lines are comments.
 - `*` is a wildcard (greedy, one per pattern). Use `:splat` in values to reference what it matched.
-- `:name` placeholders match a single path segment. Use `:name` in values to expand them.
+- `:name` placeholders match a single path segment. Use `:name` in values to expand them. They can be combined with `*` in other segments, e.g. `/:lang/docs/*`.
 - Patterns starting with `https://` match against both host and path. Host labels can be placeholders, e.g. `https://:sub.example.com/*`.
 - All matching rules are applied, in file order.
 
@@ -102,7 +102,7 @@ Place a `_redirects` file in your site root:
 
 Each line is `/from /to [status]`:
 
-- **Source** must start with `/`. Supports `*` and `:name`.
+- **Source** must start with `/`. Supports `*` and `:name`, also combined in separate segments (e.g. `/:lang/docs/*`).
 - **Destination** must start with `/` or be an absolute URL (`https://` or `http://`).
 - **Status** is optional, defaults to 302. Supported: 301, 302, 303, 307, 308.
 - `#` lines are comments.

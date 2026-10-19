@@ -735,3 +735,36 @@ func TestMergeRepeatedHeadersRemoveResets(t *testing.T) {
 		t.Errorf("want %q, got %q", want, got)
 	}
 }
+
+func TestMatchMixedPlaceholderAndSplat(t *testing.T) {
+	rules, warnings := Parse(strings.NewReader("/:lang/blog/*\n  X-Lang: :lang\n  X-Post: :splat\n"), 0, 0, 0)
+	if len(warnings) != 0 {
+		t.Fatalf("unexpected warnings: %v", warnings)
+	}
+	compiled := Compile(rules)
+
+	for _, dedup := range []bool{false, true} {
+		match := compiled.MatchOrdered
+		if dedup {
+			match = compiled.MatchBySpecificity
+		}
+		headers := make(http.Header)
+		applyHeaders(headers, match("/de/blog/2024/hello", ""), dedup)
+		if got := headers.Get("X-Lang"); got != "de" {
+			t.Errorf("dedup=%v: X-Lang: want %q, got %q", dedup, "de", got)
+		}
+		if got := headers.Get("X-Post"); got != "2024/hello" {
+			t.Errorf("dedup=%v: X-Post: want %q, got %q", dedup, "2024/hello", got)
+		}
+		if ops := match("/de/docs/x", ""); len(ops) != 0 {
+			t.Errorf("dedup=%v: expected no ops for /de/docs/x, got %v", dedup, ops)
+		}
+	}
+}
+
+func TestParsePlaceholderSharingSegmentWithSplatRejected(t *testing.T) {
+	rules, warnings := Parse(strings.NewReader("/:lang*\n  X-A: 1\n"), 0, 0, 0)
+	if len(rules) != 0 || len(warnings) == 0 {
+		t.Fatalf("expected pattern to be rejected, got %d rules, warnings %v", len(rules), warnings)
+	}
+}

@@ -182,6 +182,10 @@ func validateRedirectFrom(from string, lineNum int) error {
 		return &ParseError{Line: lineNum, Message: "only one wildcard (*) allowed per redirect source path"}
 	}
 
+	if err := validatePlaceholderSegments(from, lineNum); err != nil {
+		return err
+	}
+
 	return nil
 }
 

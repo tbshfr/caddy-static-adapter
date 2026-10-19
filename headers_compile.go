@@ -260,24 +260,7 @@ func expandOps(cr *compiledRule, ops []HeaderOp, path string) []HeaderOp {
 		return ops
 	}
 
-	// Extract splat value if pattern has wildcard.
-	var splatValue string
-	if cr.needsSplat {
-		idx := strings.Index(cr.pathPattern, "*")
-		prefix := cr.pathPattern[:idx]
-		suffix := cr.pathPattern[idx+1:]
-		remaining := path[len(prefix):]
-		if suffix != "" {
-			remaining = strings.TrimSuffix(remaining, suffix)
-		}
-		splatValue = remaining
-	}
-
-	// Extract placeholder values.
-	var placeholders map[string]string
-	if cr.needsPlaceholders {
-		placeholders, _ = extractPlaceholders(cr.pathPattern, path)
-	}
+	placeholders, splatValue, _ := capturePattern(cr.pathPattern, path)
 
 	expanded := make([]HeaderOp, len(ops))
 	for i, op := range ops {

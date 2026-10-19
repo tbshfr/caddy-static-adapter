@@ -2,28 +2,52 @@ package staticadapter
 
 import (
 	"math"
+	"slices"
 	"sort"
-	"strings"
 )
 
-// compiledRule wraps a Rule with its precomputed path pattern and optional host.
+// compiledRule wraps a Rule with its compiled path pattern and optional host.
 type compiledRule struct {
 	*Rule
-	pathPattern string
-	host        string // non-empty for absolute URL patterns
+	pattern *compiledPattern
+	host    string // non-empty for absolute URL patterns
 
-	hasSplat          bool
-	placeholderTokens []string
-	needsSplat        bool
-	needsPlaceholders bool
+	ops compiledOps
+
+	// dedupOps is Ops with repeated headers comma-joined, used in dedup
+	// mode so that "last wins" only applies across rules, not within one.
+	dedupOps compiledOps
 
 	// specificity measures how specific the pattern is. Higher values
 	// mean more specific. See computeSpecificity.
 	specificity int
+}
 
-	// dedupOps is Ops with repeated headers comma-joined, used in dedup
-	// mode so that "last wins" only applies across rules, not within one.
-	dedupOps []HeaderOp
+// compiledOps holds header operations with their values compiled as
+// templates against the rule's pattern.
+type compiledOps struct {
+	ops     []HeaderOp
+	values  []template // parallel to ops; nil when no value references the pattern
+	dynamic bool
+}
+
+func compileOps(ops []HeaderOp, p *compiledPattern) compiledOps {
+	c := compiledOps{ops: ops}
+	for i, op := range ops {
+		t := compileTemplate(op.Value, p)
+		if !t.dynamic() {
+			continue
+		}
+		if c.values == nil {
+			c.values = make([]template, len(ops))
+			for j := range ops {
+				c.values[j] = template{raw: ops[j].Value}
+			}
+		}
+		c.values[i] = t
+		c.dynamic = true
+	}
+	return c
 }
 
 // indexedRule pairs a compiledRule with its original position in the file,
@@ -42,6 +66,9 @@ type Compiled struct {
 	exactPaths map[string][]indexedRule
 	// wildcards holds rules containing * or : patterns in definition order.
 	wildcards []indexedRule
+	// bySpecificity holds the wildcards sorted by specificity (least
+	// specific first, file order for ties) for dedup matching.
+	bySpecificity []indexedRule
 }
 
 // Compile takes parsed rules and compiles them into a Compiled structure
@@ -52,55 +79,30 @@ func Compile(rules []*Rule) *Compiled {
 	}
 
 	for i, rule := range rules {
+		p := compilePattern(extractPath(rule.Pattern))
 		cr := &compiledRule{
-			Rule:        rule,
-			pathPattern: extractPath(rule.Pattern),
-			host:        extractHost(rule.Pattern),
-		}
-		cr.hasSplat = strings.Contains(cr.pathPattern, "*")
-		if strings.Contains(cr.pathPattern, ":") {
-			for _, part := range strings.Split(cr.pathPattern, "/") {
-				if strings.HasPrefix(part, ":") && len(part) > 1 {
-					cr.placeholderTokens = append(cr.placeholderTokens, part)
-				}
-			}
-			sort.Slice(cr.placeholderTokens, func(i, j int) bool {
-				return len(cr.placeholderTokens[i]) > len(cr.placeholderTokens[j])
-			})
-		}
-		if cr.hasSplat || len(cr.placeholderTokens) > 0 {
-			for _, op := range cr.Ops {
-				if !strings.Contains(op.Value, ":") {
-					continue
-				}
-				if cr.hasSplat && strings.Contains(op.Value, ":splat") {
-					cr.needsSplat = true
-				}
-				if len(cr.placeholderTokens) > 0 {
-					for _, token := range cr.placeholderTokens {
-						if strings.Contains(op.Value, token) {
-							cr.needsPlaceholders = true
-							break
-						}
-					}
-				}
-				if cr.needsSplat && cr.needsPlaceholders {
-					break
-				}
-			}
+			Rule:     rule,
+			pattern:  p,
+			host:     extractHost(rule.Pattern),
+			ops:      compileOps(rule.Ops, p),
+			dedupOps: compileOps(mergeRepeatedHeaders(rule.Ops), p),
 		}
 		// Compute specificity for dedup ordering.
-		cr.specificity = computeSpecificity(cr)
-		cr.dedupOps = mergeRepeatedHeaders(rule.Ops)
+		cr.specificity = computeSpecificity(p)
 
 		ir := indexedRule{index: i, cr: cr}
 
-		if hasWildcardOrPlaceholder(cr.pathPattern) {
-			c.wildcards = append(c.wildcards, ir)
+		if p.exact() {
+			c.exactPaths[p.raw] = append(c.exactPaths[p.raw], ir)
 		} else {
-			c.exactPaths[cr.pathPattern] = append(c.exactPaths[cr.pathPattern], ir)
+			c.wildcards = append(c.wildcards, ir)
 		}
 	}
+
+	c.bySpecificity = slices.Clone(c.wildcards)
+	sort.SliceStable(c.bySpecificity, func(i, j int) bool {
+		return c.bySpecificity[i].cr.specificity < c.bySpecificity[j].cr.specificity
+	})
 
 	return c
 }
@@ -139,15 +141,15 @@ func (c *Compiled) MatchOrdered(requestPath, requestHost string) []HeaderOp {
 			if ir.cr.host != "" && !matchHost(ir.cr.host, requestHost) {
 				continue
 			}
-			ops = append(ops, ir.cr.Ops...)
+			ops = append(ops, ir.cr.ops.ops...)
 		} else {
 			ir := c.wildcards[wi]
 			wi++
 			if ir.cr.host != "" && !matchHost(ir.cr.host, requestHost) {
 				continue
 			}
-			if matchPattern(ir.cr.pathPattern, requestPath) {
-				ops = append(ops, expandOps(ir.cr, ir.cr.Ops, requestPath)...)
+			if ir.cr.pattern.match(requestPath) {
+				ops = append(ops, expandOps(ir.cr, ir.cr.ops, requestPath)...)
 			}
 		}
 	}
@@ -162,34 +164,22 @@ func (c *Compiled) MatchOrdered(requestPath, requestHost string) []HeaderOp {
 func (c *Compiled) MatchBySpecificity(requestPath, requestHost string) []HeaderOp {
 	requestPath = normalizePath(requestPath)
 
-	// Collect all matching rules.
-	var matched []indexedRule
-
+	// Wildcards are pre-sorted by specificity; exact matches are the most
+	// specific and come last, in file order.
+	var ops []HeaderOp
+	for _, ir := range c.bySpecificity {
+		if ir.cr.host != "" && !matchHost(ir.cr.host, requestHost) {
+			continue
+		}
+		if ir.cr.pattern.match(requestPath) {
+			ops = append(ops, expandOps(ir.cr, ir.cr.dedupOps, requestPath)...)
+		}
+	}
 	for _, ir := range c.exactPaths[requestPath] {
 		if ir.cr.host != "" && !matchHost(ir.cr.host, requestHost) {
 			continue
 		}
-		matched = append(matched, ir)
-	}
-
-	for _, ir := range c.wildcards {
-		if ir.cr.host != "" && !matchHost(ir.cr.host, requestHost) {
-			continue
-		}
-		if matchPattern(ir.cr.pathPattern, requestPath) {
-			matched = append(matched, ir)
-		}
-	}
-
-	// Stable sort by specificity ascending (least specific first).
-	// File order (index) is the tiebreaker via stable sort.
-	sort.SliceStable(matched, func(i, j int) bool {
-		return matched[i].cr.specificity < matched[j].cr.specificity
-	})
-
-	var ops []HeaderOp
-	for _, ir := range matched {
-		ops = append(ops, expandOps(ir.cr, ir.cr.dedupOps, requestPath)...)
+		ops = append(ops, ir.cr.dedupOps.ops...)
 	}
 	return ops
 }
@@ -201,7 +191,7 @@ func matchExactOnly(rules []indexedRule, requestHost string) []HeaderOp {
 		if ir.cr.host != "" && !matchHost(ir.cr.host, requestHost) {
 			continue
 		}
-		ops = append(ops, ir.cr.Ops...)
+		ops = append(ops, ir.cr.ops.ops...)
 	}
 	return ops
 }
@@ -213,8 +203,8 @@ func matchWildcardOnly(wildcards []indexedRule, requestPath, requestHost string)
 		if ir.cr.host != "" && !matchHost(ir.cr.host, requestHost) {
 			continue
 		}
-		if matchPattern(ir.cr.pathPattern, requestPath) {
-			ops = append(ops, expandOps(ir.cr, ir.cr.Ops, requestPath)...)
+		if ir.cr.pattern.match(requestPath) {
+			ops = append(ops, expandOps(ir.cr, ir.cr.ops, requestPath)...)
 		}
 	}
 	return ops
@@ -229,64 +219,38 @@ func (c *Compiled) totalRules() int {
 	return total
 }
 
-// computeSpecificity returns the specificity score for a compiled rule.
+// computeSpecificity returns the specificity score for a compiled pattern.
 // Exact matches get the highest score (math.MaxInt). All other patterns are
 // scored on one scale, by their number of literal characters (everything
 // except placeholders and the '*'), so that e.g. /blog/:slug beats /b*.
 // At equal length a pattern without a splat wins, since a placeholder
 // matches a single segment while '*' matches anything.
-func computeSpecificity(cr *compiledRule) int {
-	if !cr.hasSplat && len(cr.placeholderTokens) == 0 {
+func computeSpecificity(p *compiledPattern) int {
+	if p.exact() {
 		// Exact match — highest specificity.
 		return math.MaxInt
 	}
 
-	literal := len(cr.pathPattern)
-	if cr.hasSplat {
-		literal--
-	}
-	for _, part := range strings.Split(cr.pathPattern, "/") {
-		if strings.HasPrefix(part, ":") && len(part) > 1 {
-			literal -= len(part)
-		}
-	}
-
-	score := literal * 2
-	if !cr.hasSplat {
+	score := p.literalLen * 2
+	if !p.hasSplat {
 		score++
 	}
 	return score
 }
 
 // expandOps expands placeholder references in the values of ops, which
-// must be cr.Ops or cr.dedupOps.
-func expandOps(cr *compiledRule, ops []HeaderOp, path string) []HeaderOp {
-	if !cr.needsSplat && !cr.needsPlaceholders {
-		return ops
+// must be cr.ops or cr.dedupOps.
+func expandOps(cr *compiledRule, ops compiledOps, path string) []HeaderOp {
+	if !ops.dynamic {
+		return ops.ops
 	}
 
-	placeholders, splatValue, _ := capturePattern(cr.pathPattern, path)
-
-	expanded := make([]HeaderOp, len(ops))
-	for i, op := range ops {
+	values, splat, _ := cr.pattern.capture(path)
+	expanded := make([]HeaderOp, len(ops.ops))
+	for i, op := range ops.ops {
 		expanded[i] = op
-		if strings.Contains(op.Value, ":") {
-			val := op.Value
-			if cr.needsSplat {
-				val = strings.ReplaceAll(val, ":splat", splatValue)
-			}
-			for _, token := range cr.placeholderTokens {
-				if !strings.Contains(val, token) {
-					continue
-				}
-				if pval, ok := placeholders[token[1:]]; ok {
-					val = strings.ReplaceAll(val, token, pval)
-				}
-			}
-			expanded[i].Value = val
-		}
+		expanded[i].Value = ops.values[i].expand(values, splat, false)
 	}
-
 	return expanded
 }
 

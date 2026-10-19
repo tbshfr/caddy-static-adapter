@@ -825,3 +825,31 @@ func TestDedupSpecificityComparesPatternKinds(t *testing.T) {
 		})
 	}
 }
+
+func TestHeaderValuesNotReexpanded(t *testing.T) {
+	rules, _ := Parse(strings.NewReader("/p/:a/:b\n  X-Pair: :a-:b\n/s/*\n  X-Splat: :splat\n"), 0, 0, 0)
+	c := Compile(rules)
+
+	headers := make(http.Header)
+	applyHeaders(headers, c.MatchOrdered("/p/:b/real", ""), false)
+	if got := headers.Get("X-Pair"); got != ":b-real" {
+		t.Errorf("X-Pair: want %q, got %q", ":b-real", got)
+	}
+
+	headers = make(http.Header)
+	applyHeaders(headers, c.MatchOrdered("/s/:splat", ""), false)
+	if got := headers.Get("X-Splat"); got != ":splat" {
+		t.Errorf("X-Splat: want %q, got %q", ":splat", got)
+	}
+}
+
+func TestLiteralColonPatternIsExact(t *testing.T) {
+	rules, _ := Parse(strings.NewReader("/a:b\n  X-A: 1\n"), 0, 0, 0)
+	c := Compile(rules)
+	if len(c.exactPaths) != 1 || len(c.wildcards) != 0 {
+		t.Fatalf("expected /a:b to be an exact rule, got %d exact and %d wildcards", len(c.exactPaths), len(c.wildcards))
+	}
+	if ops := c.MatchOrdered("/a:b", ""); len(ops) != 1 {
+		t.Errorf("expected /a:b to match itself, got %v", ops)
+	}
+}

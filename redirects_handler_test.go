@@ -51,7 +51,7 @@ func TestRedirectServeHTTP(t *testing.T) {
 	if match == nil {
 		t.Fatal("expected redirect match for /old")
 	}
-	to := expandRedirectTo(match.pathPattern, match.To, normalizePath(req.URL.Path))
+	to := match.expand(normalizePath(req.URL.Path))
 	http.Redirect(rec, req, to, match.Status)
 
 	if rec.Code != 301 {

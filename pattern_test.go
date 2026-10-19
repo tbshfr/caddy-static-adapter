@@ -145,16 +145,16 @@ func TestMatchPattern(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := matchPattern(tt.pattern, tt.path)
+		got := compilePattern(tt.pattern).match(tt.path)
 		if got != tt.want {
-			t.Errorf("matchPattern(%q, %q) = %v, want %v", tt.pattern, tt.path, got, tt.want)
+			t.Errorf("match(%q, %q) = %v, want %v", tt.pattern, tt.path, got, tt.want)
 		}
 	}
 }
 
 // ---------- Capture Pattern Tests ----------
 
-func TestCapturePattern(t *testing.T) {
+func TestPatternCapture(t *testing.T) {
 	tests := []struct {
 		pattern      string
 		path         string
@@ -176,44 +176,71 @@ func TestCapturePattern(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		placeholders, splat, ok := capturePattern(tt.pattern, tt.path)
+		placeholders, splat, ok := captureMap(tt.pattern, tt.path)
 		if ok != tt.ok {
-			t.Errorf("capturePattern(%q, %q) ok = %v, want %v", tt.pattern, tt.path, ok, tt.ok)
+			t.Errorf("capture(%q, %q) ok = %v, want %v", tt.pattern, tt.path, ok, tt.ok)
 			continue
 		}
 		if !ok {
 			continue
 		}
 		if splat != tt.splat {
-			t.Errorf("capturePattern(%q, %q) splat = %q, want %q", tt.pattern, tt.path, splat, tt.splat)
+			t.Errorf("capture(%q, %q) splat = %q, want %q", tt.pattern, tt.path, splat, tt.splat)
 		}
 		if len(placeholders) != len(tt.placeholders) {
-			t.Errorf("capturePattern(%q, %q) placeholders = %v, want %v", tt.pattern, tt.path, placeholders, tt.placeholders)
+			t.Errorf("capture(%q, %q) placeholders = %v, want %v", tt.pattern, tt.path, placeholders, tt.placeholders)
 			continue
 		}
 		for k, v := range tt.placeholders {
 			if placeholders[k] != v {
-				t.Errorf("capturePattern(%q, %q) placeholder %q = %q, want %q", tt.pattern, tt.path, k, placeholders[k], v)
+				t.Errorf("capture(%q, %q) placeholder %q = %q, want %q", tt.pattern, tt.path, k, placeholders[k], v)
 			}
 		}
-		if got := matchPattern(tt.pattern, tt.path); got != tt.ok {
-			t.Errorf("matchPattern(%q, %q) = %v, want %v", tt.pattern, tt.path, got, tt.ok)
+		if got := compilePattern(tt.pattern).match(tt.path); got != tt.ok {
+			t.Errorf("match(%q, %q) = %v, want %v", tt.pattern, tt.path, got, tt.ok)
 		}
 	}
 }
 
-// capturePattern must agree with matchSplat on patterns without placeholders.
-func TestCapturePatternMatchesSplat(t *testing.T) {
+// referenceMatchSplat is a straightforward matcher for patterns with a '*'
+// and no placeholders, used to cross-check compiledPattern.
+func referenceMatchSplat(pattern, path string) bool {
+	star := strings.Index(pattern, "*")
+	prefix, suffix := pattern[:star], pattern[star+1:]
+	return strings.HasPrefix(path, prefix) && strings.HasSuffix(path[len(prefix):], suffix)
+}
+
+// captureMap runs compiledPattern.capture and returns the placeholder
+// values keyed by name.
+func captureMap(pattern, path string) (map[string]string, string, bool) {
+	p := compilePattern(pattern)
+	values, splat, ok := p.capture(path)
+	if !ok {
+		return nil, "", false
+	}
+	var m map[string]string
+	for i, name := range p.names {
+		if m == nil {
+			m = make(map[string]string)
+		}
+		m[name] = values[i]
+	}
+	return m, splat, true
+}
+
+// compiledPattern must agree with a plain prefix/suffix match on patterns
+// without placeholders.
+func TestPatternCaptureMatchesSplat(t *testing.T) {
 	patterns := []string{"/*", "/blog/*", "/*.jpg", "/img-*.jpg", "/a*a", "/*/edit", "/static/*/x.js"}
 	paths := []string{"/", "/a", "/aa", "/blog", "/blog/", "/blog/a/b", "/x.jpg", "/a/b.jpg",
 		"/img-.jpg", "/img-cat.jpg", "/p/edit", "/p/q/edit", "/edit", "/static/v1/x.js", "/static/x.js"}
 
 	for _, pattern := range patterns {
 		for _, path := range paths {
-			want := matchSplat(pattern, path)
-			_, splat, got := capturePattern(pattern, path)
+			want := referenceMatchSplat(pattern, path)
+			_, splat, got := captureMap(pattern, path)
 			if got != want {
-				t.Errorf("pattern %q path %q: capturePattern ok = %v, matchSplat = %v", pattern, path, got, want)
+				t.Errorf("pattern %q path %q: capture ok = %v, reference = %v", pattern, path, got, want)
 				continue
 			}
 			if !got {
@@ -223,6 +250,22 @@ func TestCapturePatternMatchesSplat(t *testing.T) {
 			wantSplat := strings.TrimSuffix(path[star:], pattern[star+1:])
 			if splat != wantSplat {
 				t.Errorf("pattern %q path %q: splat = %q, want %q", pattern, path, splat, wantSplat)
+			}
+		}
+	}
+}
+
+func TestPatternMatchAgreesWithCapture(t *testing.T) {
+	patterns := []string{"/", "/a", "/:x", "/a/:x", "/:x/:y", "/*", "/a/*", "/*.css", "/:x/*",
+		"/*/:x", "/:x/*/:y", "/a/:x/b/*.js", "/img-*.jpg", "/a*a", "/:x/:x"}
+	paths := []string{"/", "/a", "/b", "/a/", "/a/b", "/a/b/c", "/x.css", "/a/b.css", "/a/q/b/c.js",
+		"/img-.jpg", "/img-cat.jpg", "/aa", "/a/a"}
+	for _, pattern := range patterns {
+		p := compilePattern(pattern)
+		for _, path := range paths {
+			_, _, ok := p.capture(path)
+			if got := p.match(path); got != ok {
+				t.Errorf("pattern %q path %q: match = %v, capture ok = %v", pattern, path, got, ok)
 			}
 		}
 	}

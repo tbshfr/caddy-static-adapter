@@ -12,14 +12,14 @@ func TestRedirectMatchExact(t *testing.T) {
 
 	compiled := make([]*compiledRedirect, len(rules))
 	for i, r := range rules {
-		compiled[i] = &compiledRedirect{RedirectRule: r, pathPattern: r.From}
+		compiled[i] = newCompiledRedirect(r)
 	}
 
 	// Should match.
 	requestPath := normalizePath("/old")
 	for _, cr := range compiled {
-		if matchRedirect(cr, requestPath) {
-			to := expandRedirectTo(cr.pathPattern, cr.To, requestPath)
+		if cr.pattern.match(requestPath) {
+			to := cr.expand(requestPath)
 			if to != "/new" {
 				t.Errorf("expected /new, got %s", to)
 			}
@@ -35,13 +35,13 @@ func TestRedirectMatchWildcard(t *testing.T) {
 	rules, _ := ParseRedirects(strings.NewReader(input), 0, 0, 0)
 	compiled := make([]*compiledRedirect, len(rules))
 	for i, r := range rules {
-		compiled[i] = &compiledRedirect{RedirectRule: r, pathPattern: r.From}
+		compiled[i] = newCompiledRedirect(r)
 	}
 
 	requestPath := normalizePath("/blog/hello-world")
 	for _, cr := range compiled {
-		if matchRedirect(cr, requestPath) {
-			to := expandRedirectTo(cr.pathPattern, cr.To, requestPath)
+		if cr.pattern.match(requestPath) {
+			to := cr.expand(requestPath)
 			if to != "/news/hello-world" {
 				t.Errorf("expected /news/hello-world, got %s", to)
 			}
@@ -57,13 +57,13 @@ func TestRedirectMatchWildcardDeepPath(t *testing.T) {
 	rules, _ := ParseRedirects(strings.NewReader(input), 0, 0, 0)
 	compiled := make([]*compiledRedirect, len(rules))
 	for i, r := range rules {
-		compiled[i] = &compiledRedirect{RedirectRule: r, pathPattern: r.From}
+		compiled[i] = newCompiledRedirect(r)
 	}
 
 	requestPath := normalizePath("/blog/2024/01/post-title")
 	for _, cr := range compiled {
-		if matchRedirect(cr, requestPath) {
-			to := expandRedirectTo(cr.pathPattern, cr.To, requestPath)
+		if cr.pattern.match(requestPath) {
+			to := cr.expand(requestPath)
 			if to != "/news/2024/01/post-title" {
 				t.Errorf("expected /news/2024/01/post-title, got %s", to)
 			}
@@ -79,13 +79,13 @@ func TestRedirectMatchPlaceholders(t *testing.T) {
 	rules, _ := ParseRedirects(strings.NewReader(input), 0, 0, 0)
 	compiled := make([]*compiledRedirect, len(rules))
 	for i, r := range rules {
-		compiled[i] = &compiledRedirect{RedirectRule: r, pathPattern: r.From}
+		compiled[i] = newCompiledRedirect(r)
 	}
 
 	requestPath := normalizePath("/products/abc/widget")
 	for _, cr := range compiled {
-		if matchRedirect(cr, requestPath) {
-			to := expandRedirectTo(cr.pathPattern, cr.To, requestPath)
+		if cr.pattern.match(requestPath) {
+			to := cr.expand(requestPath)
 			if to != "/items/abc/widget" {
 				t.Errorf("expected /items/abc/widget, got %s", to)
 			}
@@ -101,12 +101,12 @@ func TestRedirectNoMatch(t *testing.T) {
 	rules, _ := ParseRedirects(strings.NewReader(input), 0, 0, 0)
 	compiled := make([]*compiledRedirect, len(rules))
 	for i, r := range rules {
-		compiled[i] = &compiledRedirect{RedirectRule: r, pathPattern: r.From}
+		compiled[i] = newCompiledRedirect(r)
 	}
 
 	requestPath := normalizePath("/other")
 	for _, cr := range compiled {
-		if matchRedirect(cr, requestPath) {
+		if cr.pattern.match(requestPath) {
 			t.Fatal("expected no match for /other")
 		}
 	}
@@ -119,13 +119,13 @@ func TestRedirectFirstMatchWins(t *testing.T) {
 	rules, _ := ParseRedirects(strings.NewReader(input), 0, 0, 0)
 	compiled := make([]*compiledRedirect, len(rules))
 	for i, r := range rules {
-		compiled[i] = &compiledRedirect{RedirectRule: r, pathPattern: r.From}
+		compiled[i] = newCompiledRedirect(r)
 	}
 
 	requestPath := normalizePath("/page")
 	for _, cr := range compiled {
-		if matchRedirect(cr, requestPath) {
-			to := expandRedirectTo(cr.pathPattern, cr.To, requestPath)
+		if cr.pattern.match(requestPath) {
+			to := cr.expand(requestPath)
 			if to != "/first" {
 				t.Errorf("expected first match (/first), got %s", to)
 			}
@@ -144,13 +144,13 @@ func TestRedirectExpandSplatToAbsolute(t *testing.T) {
 	rules, _ := ParseRedirects(strings.NewReader(input), 0, 0, 0)
 	compiled := make([]*compiledRedirect, len(rules))
 	for i, r := range rules {
-		compiled[i] = &compiledRedirect{RedirectRule: r, pathPattern: r.From}
+		compiled[i] = newCompiledRedirect(r)
 	}
 
 	requestPath := normalizePath("/docs/getting-started")
 	for _, cr := range compiled {
-		if matchRedirect(cr, requestPath) {
-			to := expandRedirectTo(cr.pathPattern, cr.To, requestPath)
+		if cr.pattern.match(requestPath) {
+			to := cr.expand(requestPath)
 			if to != "https://docs.example.com/getting-started" {
 				t.Errorf("expected https://docs.example.com/getting-started, got %s", to)
 			}
@@ -191,14 +191,14 @@ func TestRedirectCloudflareExample(t *testing.T) {
 	// Test wildcard redirect.
 	compiled := make([]*compiledRedirect, len(rules))
 	for i, r := range rules {
-		compiled[i] = &compiledRedirect{RedirectRule: r, pathPattern: r.From}
+		compiled[i] = newCompiledRedirect(r)
 	}
 
 	// /blog/my-post → https://blog.example.com/my-post
 	requestPath := normalizePath("/blog/my-post")
 	for _, cr := range compiled {
-		if matchRedirect(cr, requestPath) {
-			to := expandRedirectTo(cr.pathPattern, cr.To, requestPath)
+		if cr.pattern.match(requestPath) {
+			to := cr.expand(requestPath)
 			if to != "https://blog.example.com/my-post" {
 				t.Errorf("expected https://blog.example.com/my-post, got %s", to)
 			}
@@ -209,8 +209,8 @@ func TestRedirectCloudflareExample(t *testing.T) {
 	// /products/42/widget → /products?code=42&name=widget
 	requestPath = normalizePath("/products/42/widget")
 	for _, cr := range compiled {
-		if matchRedirect(cr, requestPath) {
-			to := expandRedirectTo(cr.pathPattern, cr.To, requestPath)
+		if cr.pattern.match(requestPath) {
+			to := cr.expand(requestPath)
 			if to != "/products?code=42&name=widget" {
 				t.Errorf("expected /products?code=42&name=widget, got %s", to)
 			}
@@ -234,7 +234,7 @@ func TestRedirectMatch404RuleSkipped(t *testing.T) {
 
 	compiled := make([]*compiledRedirect, len(rules))
 	for i, r := range rules {
-		compiled[i] = &compiledRedirect{RedirectRule: r, pathPattern: r.From}
+		compiled[i] = newCompiledRedirect(r)
 	}
 	cr := compileRedirects(compiled)
 
@@ -257,7 +257,7 @@ func TestRedirectMatch404RuleSkipped(t *testing.T) {
 func TestExpandRedirectToPlaceholderPrefixes(t *testing.T) {
 	// Repeat to catch map iteration order dependence.
 	for i := 0; i < 50; i++ {
-		to := expandRedirectTo("/p/:id/:idx", "/item?a=:id&b=:idx", "/p/AAA/BBB")
+		to := newCompiledRedirect(&RedirectRule{From: "/p/:id/:idx", To: "/item?a=:id&b=:idx"}).expand("/p/AAA/BBB")
 		if to != "/item?a=AAA&b=BBB" {
 			t.Fatalf("iteration %d: expected /item?a=AAA&b=BBB, got %s", i, to)
 		}
@@ -266,7 +266,7 @@ func TestExpandRedirectToPlaceholderPrefixes(t *testing.T) {
 
 func TestExpandRedirectToValuesNotReexpanded(t *testing.T) {
 	for i := 0; i < 50; i++ {
-		to := expandRedirectTo("/p/:a/:b", "/x/:a/:b", "/p/:b/real")
+		to := newCompiledRedirect(&RedirectRule{From: "/p/:a/:b", To: "/x/:a/:b"}).expand("/p/:b/real")
 		if to != "/x/:b/real" {
 			t.Fatalf("iteration %d: expected /x/:b/real, got %s", i, to)
 		}
@@ -280,7 +280,7 @@ func TestRedirectMixedPlaceholderAndSplat(t *testing.T) {
 	}
 	compiled := make([]*compiledRedirect, len(rules))
 	for i, r := range rules {
-		compiled[i] = &compiledRedirect{RedirectRule: r, pathPattern: r.From}
+		compiled[i] = newCompiledRedirect(r)
 	}
 	cr := compileRedirects(compiled)
 
@@ -288,7 +288,7 @@ func TestRedirectMixedPlaceholderAndSplat(t *testing.T) {
 	if match == nil {
 		t.Fatal("expected match for /en/docs/intro/setup")
 	}
-	if to := expandRedirectTo(match.pathPattern, match.To, "/en/docs/intro/setup"); to != "/docs/en/intro/setup" {
+	if to := match.expand("/en/docs/intro/setup"); to != "/docs/en/intro/setup" {
 		t.Errorf("expected /docs/en/intro/setup, got %s", to)
 	}
 	if cr.MatchFirst("/en/blog/intro") != nil {

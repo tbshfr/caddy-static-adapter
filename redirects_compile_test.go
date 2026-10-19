@@ -6,10 +6,7 @@ import (
 
 // helper to build a compiledRedirect quickly.
 func cr(from, to string, status int) *compiledRedirect {
-	return &compiledRedirect{
-		RedirectRule: &RedirectRule{From: from, To: to, Status: status},
-		pathPattern:  from,
-	}
+	return newCompiledRedirect(&RedirectRule{From: from, To: to, Status: status})
 }
 
 // ---------- compileRedirects index tests ----------
@@ -326,5 +323,58 @@ func TestMatchFirstNormalizesPath(t *testing.T) {
 	m := compiled.MatchFirst("path")
 	if m == nil || m.To != "/dest" {
 		t.Fatalf("expected match for path without leading slash, got %v", m)
+	}
+}
+
+// ---------- first-segment index tests ----------
+
+func TestMatchFirstOrderAcrossSegmentIndex(t *testing.T) {
+	rules := []*compiledRedirect{
+		cr("/*", "/catch-all", 301),            // 0: any first segment
+		cr("/blog/:slug", "/blog-slug", 301),   // 1: indexed under "blog"
+		cr("/docs/*", "/docs-splat", 301),      // 2: indexed under "docs"
+		cr("/:lang/docs/*", "/lang-docs", 301), // 3: any first segment
+		cr("/docs/exact", "/docs-exact", 301),  // 4: exact
+		cr("/b*", "/b-splat", 301),             // 5: '*' in the first segment
+		cr("/news/:id", "/news-id", 301),       // 6: indexed under "news"
+	}
+	compiled := compileRedirects(rules)
+
+	if len(compiled.wildcards) != 6 || len(compiled.anyFirstSegment) != 3 {
+		t.Fatalf("expected 6 wildcards with 3 unindexed, got %d and %d", len(compiled.wildcards), len(compiled.anyFirstSegment))
+	}
+
+	// /* comes first in the file, so it wins everywhere.
+	for _, path := range []string{"/blog/x", "/docs/exact", "/news/1", "/other"} {
+		if match := compiled.MatchFirst(path); match == nil || match.To != "/catch-all" {
+			t.Errorf("%s: expected /catch-all, got %+v", path, match)
+		}
+	}
+
+	compiled = compileRedirects(rules[1:])
+	tests := []struct{ path, want string }{
+		{"/blog/x", "/blog-slug"},
+		{"/blog", "/b-splat"},
+		{"/docs/exact", "/docs-splat"},
+		{"/en/docs/x", "/lang-docs"},
+		{"/news/1", "/news-id"},
+		{"/bar", "/b-splat"},
+	}
+	for _, tt := range tests {
+		if match := compiled.MatchFirst(tt.path); match == nil || match.To != tt.want {
+			t.Errorf("%s: expected %s, got %+v", tt.path, tt.want, match)
+		}
+	}
+	if match := compiled.MatchFirst("/other"); match != nil {
+		t.Errorf("/other: expected no match, got %+v", match)
+	}
+
+	// An exact rule defined before the wildcards that could match wins.
+	compiled = compileRedirects([]*compiledRedirect{
+		cr("/docs/exact", "/docs-exact", 301),
+		cr("/docs/*", "/docs-splat", 301),
+	})
+	if match := compiled.MatchFirst("/docs/exact"); match == nil || match.To != "/docs-exact" {
+		t.Errorf("expected exact rule to win, got %+v", match)
 	}
 }

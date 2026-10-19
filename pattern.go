@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"slices"
+	"sort"
 	"strings"
 )
 
@@ -21,152 +23,275 @@ func normalizePath(path string) string {
 	return path
 }
 
-// hasWildcardOrPlaceholder returns true if the pattern contains wildcards or placeholders.
-func hasWildcardOrPlaceholder(pattern string) bool {
-	return strings.Contains(pattern, "*") || strings.Contains(pattern, ":")
+// patternSegment is one '/'-separated part of a compiled pattern: literal
+// text, or a :name placeholder that matches any single path segment.
+type patternSegment struct {
+	literal string
+	slot    int // index into the captured values for a placeholder, -1 for literal text
 }
 
-// matchPattern matches a request path against a pattern that may contain
-// a splat (*) or named placeholders (:name).
-func matchPattern(pattern, path string) bool {
-	// Handle splat wildcard.
-	if strings.Contains(pattern, "*") {
-		if strings.Contains(pattern, "/:") {
-			_, _, ok := capturePattern(pattern, path)
-			return ok
+func (s patternSegment) match(part string, values []string) bool {
+	if s.slot < 0 {
+		return part == s.literal
+	}
+	if values != nil {
+		values[s.slot] = part
+	}
+	return true
+}
+
+// compiledPattern is a URL path pattern parsed once at load time, so that
+// matching a request neither re-parses the pattern nor allocates.
+//
+// Without a splat, head holds all segments and a path must have exactly as
+// many. With a splat, head holds the segments before the '*', matched from
+// the start of the path, and tail those after it, matched from the end;
+// before and after are the literal text around the '*' within its own
+// segment (e.g. "img-" and ".jpg" in /img-*.jpg). The splat is whatever lies
+// in between.
+type compiledPattern struct {
+	raw      string
+	hasSplat bool
+	names    []string // placeholder names, indexed by patternSegment.slot
+	head     []patternSegment
+	tail     []patternSegment
+	before   string
+	after    string
+
+	// literalLen counts the characters not taken by placeholders or the
+	// '*', used to rank dedup specificity.
+	literalLen int
+}
+
+func compilePattern(raw string) *compiledPattern {
+	p := &compiledPattern{raw: raw, literalLen: len(raw)}
+
+	star := strings.IndexByte(raw, '*')
+	if star < 0 {
+		p.head = p.segments(strings.Split(raw, "/"))
+		return p
+	}
+
+	p.hasSplat = true
+	p.literalLen--
+	headParts := strings.Split(raw[:star], "/")
+	tailParts := strings.Split(raw[star+1:], "/")
+	p.before = headParts[len(headParts)-1]
+	p.after = tailParts[0]
+	p.head = p.segments(headParts[:len(headParts)-1])
+	p.tail = p.segments(tailParts[1:])
+	return p
+}
+
+// segments compiles whole path segments, registering placeholder names. A
+// name used twice shares one slot, so the later segment's value wins.
+func (p *compiledPattern) segments(parts []string) []patternSegment {
+	segs := make([]patternSegment, len(parts))
+	for i, part := range parts {
+		segs[i] = patternSegment{literal: part, slot: -1}
+		if len(part) < 2 || part[0] != ':' {
+			continue
 		}
-		return matchSplat(pattern, path)
+		name := part[1:]
+		segs[i].slot = slices.Index(p.names, name)
+		if segs[i].slot < 0 {
+			segs[i].slot = len(p.names)
+			p.names = append(p.names, name)
+		}
+		p.literalLen -= len(part)
 	}
-
-	// Handle placeholders.
-	if strings.Contains(pattern, ":") {
-		return matchPlaceholders(pattern, path)
-	}
-
-	return pattern == path
+	return segs
 }
 
-// matchSplat matches a path against a pattern containing a single *.
-// The * greedily matches all characters.
-func matchSplat(pattern, path string) bool {
-	starIdx := strings.Index(pattern, "*")
-	prefix := pattern[:starIdx]
-	suffix := pattern[starIdx+1:]
-
-	if !strings.HasPrefix(path, prefix) {
-		return false
-	}
-
-	if suffix == "" {
-		return true
-	}
-
-	remaining := path[len(prefix):]
-	return strings.HasSuffix(remaining, suffix)
+// exact reports whether the pattern only matches its own literal text.
+func (p *compiledPattern) exact() bool {
+	return !p.hasSplat && len(p.names) == 0
 }
 
-// matchPlaceholders matches a path against a pattern with named placeholders.
-// Placeholders match all characters except '/'.
-func matchPlaceholders(pattern, path string) bool {
-	_, ok := extractPlaceholders(pattern, path)
+// firstSegment returns the literal first path segment every match must
+// have, if the pattern fixes one (e.g. "blog" for /blog/:slug).
+func (p *compiledPattern) firstSegment() (string, bool) {
+	if len(p.head) < 2 || p.head[0].slot >= 0 || p.head[0].literal != "" || p.head[1].slot >= 0 {
+		return "", false
+	}
+	return p.head[1].literal, true
+}
+
+// match reports whether path matches the pattern.
+func (p *compiledPattern) match(path string) bool {
+	_, _, ok := p.walk(path, nil)
 	return ok
 }
 
-// extractPlaceholders extracts placeholder values from a path given a pattern.
-// Returns the map of placeholder names to values, and whether the match succeeded.
-func extractPlaceholders(pattern, path string) (map[string]string, bool) {
-	patternParts := strings.Split(pattern, "/")
-	pathParts := strings.Split(path, "/")
-
-	if len(patternParts) != len(pathParts) {
-		return nil, false
+// capture matches path and returns the placeholder values, indexed like
+// p.names, and the splat value.
+func (p *compiledPattern) capture(path string) (values []string, splat string, ok bool) {
+	if len(p.names) > 0 {
+		values = make([]string, len(p.names))
 	}
-
-	result := make(map[string]string)
-	for i, pp := range patternParts {
-		if strings.HasPrefix(pp, ":") {
-			// This is a placeholder - extract value.
-			name := pp[1:]
-			if name == "" {
-				return nil, false
-			}
-			result[name] = pathParts[i]
-		} else if pp != pathParts[i] {
-			return nil, false
-		}
+	start, end, ok := p.walk(path, values)
+	if !ok {
+		return nil, "", false
 	}
-
-	return result, true
+	if p.hasSplat {
+		splat = path[start:end]
+	}
+	return values, splat, true
 }
 
-// capturePattern matches path against pattern and returns the values of its
-// named placeholders and its splat. Unlike matchSplat and
-// extractPlaceholders it supports patterns that combine both, such as
-// /:lang/docs/* or /*/:file.
-//
-// Segments before the '*' are matched from the start of the path and
-// segments after it from the end; the splat is whatever lies in between.
-func capturePattern(pattern, path string) (placeholders map[string]string, splat string, ok bool) {
-	star := strings.IndexByte(pattern, '*')
-	if star < 0 {
-		placeholders, ok = extractPlaceholders(pattern, path)
-		return placeholders, "", ok
-	}
-
-	pathSegs := strings.Split(path, "/")
-	prefixSegs := strings.Split(pattern[:star], "/")
-	suffixSegs := strings.Split(pattern[star+1:], "/")
-
-	// The splat starts inside path segment first and ends inside path segment last.
-	first := len(prefixSegs) - 1
-	last := len(pathSegs) - len(suffixSegs)
-	if first > last {
-		return nil, "", false
-	}
-
-	capture := func(patternSeg, pathSeg string) bool {
-		if !strings.HasPrefix(patternSeg, ":") {
-			return patternSeg == pathSeg
+// walk matches path, storing placeholder values when values is non-nil,
+// and returns the bounds of the splat within path.
+func (p *compiledPattern) walk(path string, values []string) (start, end int, ok bool) {
+	rest := path
+	if !p.hasSplat {
+		for i, seg := range p.head {
+			part := rest
+			if i < len(p.head)-1 {
+				j := strings.IndexByte(rest, '/')
+				if j < 0 {
+					return 0, 0, false
+				}
+				part, rest = rest[:j], rest[j+1:]
+			} else if strings.IndexByte(rest, '/') >= 0 {
+				return 0, 0, false
+			}
+			if !seg.match(part, values) {
+				return 0, 0, false
+			}
 		}
-		if len(patternSeg) == 1 {
-			return false
-		}
-		if placeholders == nil {
-			placeholders = make(map[string]string)
-		}
-		placeholders[patternSeg[1:]] = pathSeg
-		return true
+		return 0, 0, true
 	}
 
-	start := 0
-	for i, seg := range prefixSegs[:first] {
-		if !capture(seg, pathSegs[i]) {
-			return nil, "", false
+	for _, seg := range p.head {
+		j := strings.IndexByte(rest, '/')
+		if j < 0 || !seg.match(rest[:j], values) {
+			return 0, 0, false
 		}
-		start += len(pathSegs[i]) + 1
+		rest = rest[j+1:]
 	}
+	start = len(path) - len(rest)
 
-	end := len(path)
-	for i, seg := range suffixSegs[1:] {
-		pathSeg := pathSegs[last+1+i]
-		if !capture(seg, pathSeg) {
-			return nil, "", false
+	// Matching the tail only within what the head left keeps both apart.
+	for i := len(p.tail) - 1; i >= 0; i-- {
+		j := strings.LastIndexByte(rest, '/')
+		if j < 0 || !p.tail[i].match(rest[j+1:], values) {
+			return 0, 0, false
 		}
-		end -= len(pathSeg) + 1
+		rest = rest[:j]
+	}
+	end = start + len(rest)
+
+	if len(rest) < len(p.before)+len(p.after) ||
+		!strings.HasPrefix(rest, p.before) || !strings.HasSuffix(rest, p.after) {
+		return 0, 0, false
+	}
+	return start + len(p.before), end - len(p.after), true
+}
+
+// splatSlot marks a template part that refers to :splat.
+const splatSlot = -2
+
+// templatePart is literal text (slot -1) or a reference to a captured
+// placeholder value or the splat.
+type templatePart struct {
+	literal string
+	slot    int
+}
+
+// template is a header value or redirect destination whose :name and
+// :splat references were resolved against a pattern at load time, so
+// expanding it is a single pass. Substituted values are never scanned
+// again, so a value containing ":name" is not expanded a second time.
+type template struct {
+	raw   string
+	parts []templatePart // nil when raw has no references
+}
+
+func compileTemplate(raw string, p *compiledPattern) template {
+	t := template{raw: raw}
+	if !strings.Contains(raw, ":") || (!p.hasSplat && len(p.names) == 0) {
+		return t
 	}
 
-	// Literal text directly around the '*', e.g. "img-" and ".jpg" in /img-*.jpg.
-	before, after := prefixSegs[first], suffixSegs[0]
-	if !strings.HasPrefix(pathSegs[first], before) || !strings.HasSuffix(pathSegs[last], after) {
-		return nil, "", false
+	type token struct {
+		text string
+		slot int
 	}
-	start += len(before)
-	end -= len(after)
-	if start > end {
-		return nil, "", false
+	var tokens []token
+	if p.hasSplat {
+		tokens = append(tokens, token{":splat", splatSlot})
 	}
+	for i, name := range p.names {
+		tokens = append(tokens, token{":" + name, i})
+	}
+	// Longer tokens first, or :id would match inside :idx.
+	sort.SliceStable(tokens, func(i, j int) bool { return len(tokens[i].text) > len(tokens[j].text) })
 
-	return placeholders, path[start:end], true
+	lit := 0
+	for i := 0; i < len(raw); {
+		matched := false
+		if raw[i] == ':' {
+			for _, tok := range tokens {
+				if strings.HasPrefix(raw[i:], tok.text) {
+					if lit < i {
+						t.parts = append(t.parts, templatePart{literal: raw[lit:i], slot: -1})
+					}
+					t.parts = append(t.parts, templatePart{slot: tok.slot})
+					i += len(tok.text)
+					lit = i
+					matched = true
+					break
+				}
+			}
+		}
+		if !matched {
+			i++
+		}
+	}
+	if t.parts != nil && lit < len(raw) {
+		t.parts = append(t.parts, templatePart{literal: raw[lit:], slot: -1})
+	}
+	return t
+}
+
+// dynamic reports whether the template references the pattern.
+func (t template) dynamic() bool {
+	return t.parts != nil
+}
+
+// expand substitutes captured values. With escape set, values are
+// percent-encoded for use in a URL.
+func (t template) expand(values []string, splat string, escape bool) string {
+	if t.parts == nil {
+		return t.raw
+	}
+	var b strings.Builder
+	b.Grow(len(t.raw) + len(splat))
+	for _, part := range t.parts {
+		switch {
+		case part.slot == -1:
+			b.WriteString(part.literal)
+		case part.slot == splatSlot && escape:
+			b.WriteString(escapeSplat(splat))
+		case part.slot == splatSlot:
+			b.WriteString(splat)
+		case escape:
+			b.WriteString(url.PathEscape(values[part.slot]))
+		default:
+			b.WriteString(values[part.slot])
+		}
+	}
+	return b.String()
+}
+
+// escapeSplat percent-encodes each segment of a splat value while keeping
+// the '/' separators intact.
+func escapeSplat(splat string) string {
+	segments := strings.Split(splat, "/")
+	for i, s := range segments {
+		segments[i] = url.PathEscape(s)
+	}
+	return strings.Join(segments, "/")
 }
 
 // validatePlaceholderSegments reports an error when a placeholder shares a

@@ -3,10 +3,8 @@ package staticadapter
 import (
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
@@ -30,10 +28,44 @@ type RedirectHandler struct {
 	fileHandler
 }
 
-// compiledRedirect holds a parsed redirect rule with its precomputed path pattern.
+// compiledRedirect holds a parsed redirect rule with its compiled source
+// pattern and destination.
 type compiledRedirect struct {
 	*RedirectRule
-	pathPattern string
+	pattern *compiledPattern
+	to      template
+}
+
+func newCompiledRedirect(r *RedirectRule) *compiledRedirect {
+	p := compilePattern(r.From)
+	return &compiledRedirect{RedirectRule: r, pattern: p, to: compileTemplate(r.To, p)}
+}
+
+// expand returns the redirect destination for requestPath, which must match
+// the rule.
+//
+// requestPath is the decoded r.URL.Path, so expanded values are re-escaped
+// before insertion. Otherwise a request like /go/%5Cevil.com or /to/evil.com%23
+// would put a literal \ or # into the Location header and send the client to
+// another host.
+func (cr *compiledRedirect) expand(requestPath string) string {
+	if !cr.to.dynamic() {
+		return cr.To
+	}
+	values, splat, ok := cr.pattern.capture(requestPath)
+	if !ok {
+		return cr.To
+	}
+	to := cr.to.expand(values, splat, true)
+
+	// A destination like /:splat expanded from /go//evil.com becomes
+	// //evil.com, which browsers treat as protocol-relative. Only collapse
+	// when expansion introduced it, so an explicit //host destination in
+	// the _redirects file keeps working.
+	if strings.HasPrefix(to, "//") && !strings.HasPrefix(cr.To, "//") {
+		to = "/" + strings.TrimLeft(to, "/")
+	}
+	return to
 }
 
 // indexedRedirect pairs a compiledRedirect with its original file position.
@@ -51,6 +83,13 @@ type CompiledRedirects struct {
 	exactRedirects map[string][]indexedRedirect
 	// wildcards holds redirect rules containing * or : patterns in definition order.
 	wildcards []indexedRedirect
+
+	// byFirstSegment indexes wildcards by the literal first path segment
+	// they require (e.g. "blog" for /blog/:slug), so a request only checks
+	// rules that can match it; anyFirstSegment holds the rest. Both keep
+	// definition order.
+	byFirstSegment  map[string][]indexedRedirect
+	anyFirstSegment []indexedRedirect
 }
 
 // compileRedirects creates an indexed CompiledRedirects from a list of
@@ -58,13 +97,19 @@ type CompiledRedirects struct {
 func compileRedirects(rules []*compiledRedirect) *CompiledRedirects {
 	cr := &CompiledRedirects{
 		exactRedirects: make(map[string][]indexedRedirect, len(rules)),
+		byFirstSegment: make(map[string][]indexedRedirect),
 	}
 	for i, r := range rules {
 		ir := indexedRedirect{index: i, cr: r}
-		if hasWildcardOrPlaceholder(r.pathPattern) {
-			cr.wildcards = append(cr.wildcards, ir)
+		if r.pattern.exact() {
+			cr.exactRedirects[r.pattern.raw] = append(cr.exactRedirects[r.pattern.raw], ir)
+			continue
+		}
+		cr.wildcards = append(cr.wildcards, ir)
+		if first, ok := r.pattern.firstSegment(); ok {
+			cr.byFirstSegment[first] = append(cr.byFirstSegment[first], ir)
 		} else {
-			cr.exactRedirects[r.pathPattern] = append(cr.exactRedirects[r.pathPattern], ir)
+			cr.anyFirstSegment = append(cr.anyFirstSegment, ir)
 		}
 	}
 	return cr
@@ -83,14 +128,23 @@ func (cr *CompiledRedirects) MatchFirst(requestPath string) *compiledRedirect {
 		bestExact = &exactCandidates[0] // already in definition order
 	}
 
-	// Scan wildcards, looking for a match with a lower index than the best exact.
-	for _, ir := range cr.wildcards {
+	// Merge the two candidate buckets in definition order, looking for a
+	// match with a lower index than the best exact.
+	a := cr.byFirstSegment[firstPathSegment(requestPath)]
+	b := cr.anyFirstSegment
+	for len(a) > 0 || len(b) > 0 {
+		var ir indexedRedirect
+		if len(b) == 0 || (len(a) > 0 && a[0].index < b[0].index) {
+			ir, a = a[0], a[1:]
+		} else {
+			ir, b = b[0], b[1:]
+		}
 		// If we already have an exact match and this wildcard comes after it,
 		// stop — no wildcard can beat the exact match.
 		if bestExact != nil && ir.index > bestExact.index {
 			break
 		}
-		if matchRedirect(ir.cr, requestPath) {
+		if ir.cr.pattern.match(requestPath) {
 			return ir.cr
 		}
 	}
@@ -100,6 +154,15 @@ func (cr *CompiledRedirects) MatchFirst(requestPath string) *compiledRedirect {
 	}
 
 	return nil
+}
+
+// firstPathSegment returns the first segment of a path starting with '/'.
+func firstPathSegment(path string) string {
+	rest := path[1:]
+	if i := strings.IndexByte(rest, '/'); i >= 0 {
+		return rest[:i]
+	}
+	return rest
 }
 
 // totalRules returns the total number of compiled redirect rules across all buckets.
@@ -148,7 +211,7 @@ func (h *RedirectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next
 	compiled := h.getCompiledRedirects(filePath)
 	if compiled != nil {
 		if match := compiled.MatchFirst(r.URL.Path); match != nil {
-			to := expandRedirectTo(match.pathPattern, match.To, normalizePath(r.URL.Path))
+			to := match.expand(normalizePath(r.URL.Path))
 			http.Redirect(w, r, to, match.Status)
 			return nil
 		}
@@ -187,10 +250,7 @@ func (h *RedirectHandler) loadRedirectFile(filePath string) (any, error) {
 
 	rules := make([]*compiledRedirect, len(parsed))
 	for i, r := range parsed {
-		rules[i] = &compiledRedirect{
-			RedirectRule: r,
-			pathPattern:  r.From,
-		}
+		rules[i] = newCompiledRedirect(r)
 	}
 
 	compiled := compileRedirects(rules)
@@ -199,77 +259,6 @@ func (h *RedirectHandler) loadRedirectFile(filePath string) (any, error) {
 		zap.String("file", filePath),
 		zap.Int("total_rules", len(rules)))
 	return compiled, nil
-}
-
-// matchRedirect checks whether a request path matches a compiled redirect rule.
-func matchRedirect(cr *compiledRedirect, requestPath string) bool {
-	if hasWildcardOrPlaceholder(cr.pathPattern) {
-		return matchPattern(cr.pathPattern, requestPath)
-	}
-	return cr.pathPattern == requestPath
-}
-
-// expandRedirectTo expands placeholders and :splat in the redirect destination.
-//
-// requestPath is the decoded r.URL.Path, so expanded values are re-escaped
-// before insertion. Otherwise a request like /go/%5Cevil.com or /to/evil.com%23
-// would put a literal \ or # into the Location header and send the client to
-// another host.
-func expandRedirectTo(pattern, to, requestPath string) string {
-	if !strings.Contains(to, ":") {
-		return to
-	}
-	original := to
-
-	placeholders, splat, ok := capturePattern(pattern, requestPath)
-	if !ok {
-		return to
-	}
-
-	type replacement struct{ token, value string }
-	var replacements []replacement
-	if strings.Contains(pattern, "*") {
-		replacements = append(replacements, replacement{":splat", escapeSplat(splat)})
-	}
-	for name, val := range placeholders {
-		replacements = append(replacements, replacement{":" + name, url.PathEscape(val)})
-	}
-
-	if len(replacements) == 0 {
-		return to
-	}
-
-	// strings.Replacer tries tokens in argument order at each position, so
-	// longer tokens must come first or :id would match inside :idx. Its single
-	// pass also keeps a value containing ":name" from being expanded again.
-	sort.Slice(replacements, func(i, j int) bool {
-		return len(replacements[i].token) > len(replacements[j].token)
-	})
-	oldnew := make([]string, 0, 2*len(replacements))
-	for _, r := range replacements {
-		oldnew = append(oldnew, r.token, r.value)
-	}
-	to = strings.NewReplacer(oldnew...).Replace(to)
-
-	// A destination like /:splat expanded from /go//evil.com becomes
-	// //evil.com, which browsers treat as protocol-relative. Only collapse
-	// when expansion introduced it, so an explicit //host destination in
-	// the _redirects file keeps working.
-	if strings.HasPrefix(to, "//") && !strings.HasPrefix(original, "//") {
-		to = "/" + strings.TrimLeft(to, "/")
-	}
-
-	return to
-}
-
-// escapeSplat percent-encodes each segment of a splat value while keeping
-// the '/' separators intact.
-func escapeSplat(splat string) string {
-	segments := strings.Split(splat, "/")
-	for i, s := range segments {
-		segments[i] = url.PathEscape(s)
-	}
-	return strings.Join(segments, "/")
 }
 
 // UnmarshalCaddyfile implements caddyfile.Unmarshaler.

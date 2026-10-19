@@ -51,7 +51,7 @@ func TestRedirectServeHTTP(t *testing.T) {
 	if match == nil {
 		t.Fatal("expected redirect match for /old")
 	}
-	to := match.expand(normalizePath(req.URL.Path))
+	to, _ := match.expand(normalizePath(req.URL.Path))
 	http.Redirect(rec, req, to, match.Status)
 
 	if rec.Code != 301 {
@@ -363,6 +363,8 @@ func TestRedirectExpansionCannotChangeHost(t *testing.T) {
 	rules := "/go/* /:splat 301\n" +
 		"/p/:name /:name 301\n" +
 		"/to/:site https://:site.example.com/ 301\n" +
+		"/tld/:tld https://example.:tld/ 301\n" +
+		"/port/* https://example.com:splat 301\n" +
 		"/old/* /new/:splat 301\n" +
 		"/cdn/* //cdn.example.com/:splat 301\n"
 	if err := os.WriteFile(filepath.Join(dir, "_redirects"), []byte(rules), 0644); err != nil {
@@ -372,6 +374,7 @@ func TestRedirectExpansionCannotChangeHost(t *testing.T) {
 	h := newTestRedirectHandler()
 	defer h.Cleanup()
 
+	// An empty want means the request is not redirected but passed on.
 	tests := []struct {
 		path string
 		want string
@@ -379,7 +382,14 @@ func TestRedirectExpansionCannotChangeHost(t *testing.T) {
 		{"/go//evil.com", "/evil.com"},
 		{"/go/%5Cevil.com", "/%5Cevil.com"},
 		{"/p/%5Cevil.com", "/%5Cevil.com"},
-		{"/to/evil.com%23", "https://evil.com%23.example.com/"},
+		{"/to/docs", "https://docs.example.com/"},
+		{"/to/evil.com%23", ""},
+		{"/to/evil.com%2523", ""},
+		{"/to/evil.com@", ""},
+		{"/tld/com", "https://example.com/"},
+		{"/tld/com.evil.com", ""},
+		{"/port/@evil.com", ""},
+		{"/port/.evil.com", ""},
 		{"/old/a%3Fb", "/new/a%3Fb"},
 		{"/old/a%20b/c", "/new/a%20b/c"},
 		{"/cdn/app.js", "//cdn.example.com/app.js"},
@@ -392,12 +402,42 @@ func TestRedirectExpansionCannotChangeHost(t *testing.T) {
 		req = req.WithContext(context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl))
 		rec := httptest.NewRecorder()
 
-		next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error { return nil })
+		nextCalled := false
+		next := caddyhttp.HandlerFunc(func(w http.ResponseWriter, r *http.Request) error {
+			nextCalled = true
+			return nil
+		})
 		if err := h.ServeHTTP(rec, req, next); err != nil {
 			t.Fatalf("path %q: unexpected error: %v", tt.path, err)
 		}
 		if got := rec.Header().Get("Location"); got != tt.want {
 			t.Errorf("path %q: expected Location %q, got %q", tt.path, tt.want, got)
+		}
+		if nextCalled != (tt.want == "") {
+			t.Errorf("path %q: expected next handler called: %v, got %v", tt.path, tt.want == "", nextCalled)
+		}
+	}
+}
+
+func TestRedirectHostValuesInTemplateParts(t *testing.T) {
+	tests := []struct {
+		from, to, path, want string
+		ok                   bool
+	}{
+		{"/s/:sub", "https://:sub.example.com/:sub", "/s/a-1", "https://a-1.example.com/a-1", true},
+		{"/s/:sub", "http://:sub.example.com/", "/s/a.b", "", false},
+		{"/s/:sub", "https://example.com/:sub", "/s/a.b@c", "https://example.com/a.b@c", true},
+		{"/s/:sub", "https://example.com?q=:sub", "/s/a.b", "https://example.com?q=a.b", true},
+		{"/s/:sub", "https://example.com#:sub", "/s/a.b", "https://example.com#a.b", true},
+		{"/s/:sub", `https://example.com\:sub`, "/s/a.b", `https://example.com\a.b`, true},
+		{"/s/:user", "https://:user@example.com/", "/s/evil.com:x", "", false},
+		{"/s/*", "https://:splat.example.com/", "/s/a/b", "", false},
+		{"/s/:sub", "/:sub", "/s/a.b", "/a.b", true},
+	}
+	for _, tt := range tests {
+		got, ok := newCompiledRedirect(&RedirectRule{From: tt.from, To: tt.to}).expand(tt.path)
+		if got != tt.want || ok != tt.ok {
+			t.Errorf("%s -> %s for %s: want %q, %v, got %q, %v", tt.from, tt.to, tt.path, tt.want, tt.ok, got, ok)
 		}
 	}
 }

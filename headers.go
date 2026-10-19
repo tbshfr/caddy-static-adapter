@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"github.com/caddyserver/caddy/v2"
@@ -82,12 +83,20 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	return next.ServeHTTP(w, r)
 }
 
+// windowsPaths is whether file_server resolves request paths to files the
+// way Windows does (see windowsPath). Tests change it.
+var windowsPaths = runtime.GOOS == "windows"
+
 // cleanRequestPath resolves dot segments and merges repeated slashes, as
-// file_server does when it maps a request path to a file. Matching the raw
-// path would let //admin/x or /a/../admin/x be served the file /admin/x
-// without the headers of an /admin/* rule. Clean paths, the common case,
-// are returned as they are, without allocating.
+// file_server does when it maps a request path to a file, and on Windows
+// also resolves the path the way Windows would. Matching the raw path would
+// let //admin/x, /a/../admin/x or, on Windows, /admin\x be served the file
+// /admin/x without the headers of an /admin/* rule. Clean paths, the common
+// case, are returned as they are, without allocating.
 func cleanRequestPath(p string) string {
+	if windowsPaths && hasWindowsPathQuirks(p) {
+		return caddyhttp.CleanPath(windowsPath(p), true)
+	}
 	for i := 0; i < len(p); i++ {
 		if p[i] != '/' {
 			continue
@@ -99,6 +108,22 @@ func cleanRequestPath(p string) string {
 		}
 	}
 	return p
+}
+
+// hasWindowsPathQuirks reports whether p contains a backslash or a segment
+// ending in a dot or space, which windowsPath would change.
+func hasWindowsPathQuirks(p string) bool {
+	for i := 0; i < len(p); i++ {
+		switch p[i] {
+		case '\\':
+			return true
+		case '.', ' ':
+			if i+1 == len(p) || p[i+1] == '/' {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // getCompiled returns the compiled header rules for the given file path.
@@ -129,11 +154,31 @@ func (h *Handler) loadFile(filePath string) (any, error) {
 		h.logger.Warn(h.logPrefix+": parse warning", zap.Error(w))
 	}
 
-	compiled := Compile(rules)
+	foldCase := false
+	if info, err := f.Stat(); err == nil {
+		foldCase = caseInsensitiveDir(filePath, info)
+	}
+	compiled := compileRules(rules, foldCase)
 	h.logger.Info(h.logPrefix+": loaded rules",
 		zap.String("file", filePath),
-		zap.Int("total_rules", len(rules)))
+		zap.Int("total_rules", len(rules)),
+		zap.Bool("case_insensitive", foldCase))
 	return compiled, nil
+}
+
+// caseInsensitiveDir reports whether the file at filePath, described by
+// info, is also found under its name in upper case, as on the default
+// filesystems of macOS and Windows. file_server then serves /ADMIN/x as the
+// file /admin/x, so rules must match regardless of case for it to get the
+// headers of an /admin/* rule.
+func caseInsensitiveDir(filePath string, info os.FileInfo) bool {
+	dir, name := filepath.Split(filePath)
+	upper := strings.ToUpper(name)
+	if upper == name {
+		return false
+	}
+	other, err := statIdentity(filepath.Join(dir, upper))
+	return err == nil && os.SameFile(info, other)
 }
 
 // applyHeaders applies the given header operations to the response headers.

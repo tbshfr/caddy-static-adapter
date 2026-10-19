@@ -19,7 +19,7 @@ func TestRedirectMatchExact(t *testing.T) {
 	requestPath := normalizePath("/old")
 	for _, cr := range compiled {
 		if cr.pattern.match(requestPath) {
-			to := cr.expand(requestPath)
+			to, _ := cr.expand(requestPath)
 			if to != "/new" {
 				t.Errorf("expected /new, got %s", to)
 			}
@@ -41,7 +41,7 @@ func TestRedirectMatchWildcard(t *testing.T) {
 	requestPath := normalizePath("/blog/hello-world")
 	for _, cr := range compiled {
 		if cr.pattern.match(requestPath) {
-			to := cr.expand(requestPath)
+			to, _ := cr.expand(requestPath)
 			if to != "/news/hello-world" {
 				t.Errorf("expected /news/hello-world, got %s", to)
 			}
@@ -63,7 +63,7 @@ func TestRedirectMatchWildcardDeepPath(t *testing.T) {
 	requestPath := normalizePath("/blog/2024/01/post-title")
 	for _, cr := range compiled {
 		if cr.pattern.match(requestPath) {
-			to := cr.expand(requestPath)
+			to, _ := cr.expand(requestPath)
 			if to != "/news/2024/01/post-title" {
 				t.Errorf("expected /news/2024/01/post-title, got %s", to)
 			}
@@ -85,7 +85,7 @@ func TestRedirectMatchPlaceholders(t *testing.T) {
 	requestPath := normalizePath("/products/abc/widget")
 	for _, cr := range compiled {
 		if cr.pattern.match(requestPath) {
-			to := cr.expand(requestPath)
+			to, _ := cr.expand(requestPath)
 			if to != "/items/abc/widget" {
 				t.Errorf("expected /items/abc/widget, got %s", to)
 			}
@@ -125,7 +125,7 @@ func TestRedirectFirstMatchWins(t *testing.T) {
 	requestPath := normalizePath("/page")
 	for _, cr := range compiled {
 		if cr.pattern.match(requestPath) {
-			to := cr.expand(requestPath)
+			to, _ := cr.expand(requestPath)
 			if to != "/first" {
 				t.Errorf("expected first match (/first), got %s", to)
 			}
@@ -150,7 +150,7 @@ func TestRedirectExpandSplatToAbsolute(t *testing.T) {
 	requestPath := normalizePath("/docs/getting-started")
 	for _, cr := range compiled {
 		if cr.pattern.match(requestPath) {
-			to := cr.expand(requestPath)
+			to, _ := cr.expand(requestPath)
 			if to != "https://docs.example.com/getting-started" {
 				t.Errorf("expected https://docs.example.com/getting-started, got %s", to)
 			}
@@ -198,7 +198,7 @@ func TestRedirectCloudflareExample(t *testing.T) {
 	requestPath := normalizePath("/blog/my-post")
 	for _, cr := range compiled {
 		if cr.pattern.match(requestPath) {
-			to := cr.expand(requestPath)
+			to, _ := cr.expand(requestPath)
 			if to != "https://blog.example.com/my-post" {
 				t.Errorf("expected https://blog.example.com/my-post, got %s", to)
 			}
@@ -210,7 +210,7 @@ func TestRedirectCloudflareExample(t *testing.T) {
 	requestPath = normalizePath("/products/42/widget")
 	for _, cr := range compiled {
 		if cr.pattern.match(requestPath) {
-			to := cr.expand(requestPath)
+			to, _ := cr.expand(requestPath)
 			if to != "/products?code=42&name=widget" {
 				t.Errorf("expected /products?code=42&name=widget, got %s", to)
 			}
@@ -257,7 +257,7 @@ func TestRedirectMatch404RuleSkipped(t *testing.T) {
 func TestExpandRedirectToPlaceholderPrefixes(t *testing.T) {
 	// Repeat to catch map iteration order dependence.
 	for i := 0; i < 50; i++ {
-		to := newCompiledRedirect(&RedirectRule{From: "/p/:id/:idx", To: "/item?a=:id&b=:idx"}).expand("/p/AAA/BBB")
+		to, _ := newCompiledRedirect(&RedirectRule{From: "/p/:id/:idx", To: "/item?a=:id&b=:idx"}).expand("/p/AAA/BBB")
 		if to != "/item?a=AAA&b=BBB" {
 			t.Fatalf("iteration %d: expected /item?a=AAA&b=BBB, got %s", i, to)
 		}
@@ -266,7 +266,7 @@ func TestExpandRedirectToPlaceholderPrefixes(t *testing.T) {
 
 func TestExpandRedirectToValuesNotReexpanded(t *testing.T) {
 	for i := 0; i < 50; i++ {
-		to := newCompiledRedirect(&RedirectRule{From: "/p/:a/:b", To: "/x/:a/:b"}).expand("/p/:b/real")
+		to, _ := newCompiledRedirect(&RedirectRule{From: "/p/:a/:b", To: "/x/:a/:b"}).expand("/p/:b/real")
 		if to != "/x/:b/real" {
 			t.Fatalf("iteration %d: expected /x/:b/real, got %s", i, to)
 		}
@@ -288,7 +288,7 @@ func TestRedirectMixedPlaceholderAndSplat(t *testing.T) {
 	if match == nil {
 		t.Fatal("expected match for /en/docs/intro/setup")
 	}
-	if to := match.expand("/en/docs/intro/setup"); to != "/docs/en/intro/setup" {
+	if to, _ := match.expand("/en/docs/intro/setup"); to != "/docs/en/intro/setup" {
 		t.Errorf("expected /docs/en/intro/setup, got %s", to)
 	}
 	if cr.MatchFirst("/en/blog/intro") != nil {
@@ -314,7 +314,7 @@ func TestRedirectQueryPlaceholdersEscaped(t *testing.T) {
 		{"/v/:v", "https://example.com/:v?ref=:v#top", "/v/a=b", "https://example.com/a=b?ref=a%3Db#top"},
 	}
 	for _, tt := range tests {
-		got := newCompiledRedirect(&RedirectRule{From: tt.from, To: tt.to}).expand(tt.path)
+		got, _ := newCompiledRedirect(&RedirectRule{From: tt.from, To: tt.to}).expand(tt.path)
 		if got != tt.want {
 			t.Errorf("%s -> %s for %s: want %s, got %s", tt.from, tt.to, tt.path, tt.want, got)
 		}

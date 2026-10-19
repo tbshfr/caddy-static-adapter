@@ -7,6 +7,8 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 )
 
 // normalizePath ensures a URL path has a leading slash for consistent matching.
@@ -44,6 +46,12 @@ func (s patternSegment) match(part string, values []string) bool {
 	return true
 }
 
+// matchFold reports whether part matches literal text regardless of case.
+// It is separate from match so that match stays cheap enough to inline.
+func (s patternSegment) matchFold(part string) bool {
+	return s.slot < 0 && foldEqual(part, s.literal)
+}
+
 // compiledPattern is a URL path pattern parsed once at load time, so that
 // matching a request neither re-parses the pattern nor allocates.
 //
@@ -65,6 +73,9 @@ type compiledPattern struct {
 	// literalLen counts the characters not taken by placeholders or the
 	// '*', used to rank dedup specificity.
 	literalLen int
+
+	// fold makes literal text match regardless of case (see foldRune).
+	fold bool
 }
 
 func compilePattern(raw string) *compiledPattern {
@@ -115,7 +126,7 @@ func (p *compiledPattern) exact() bool {
 // firstSegment returns the literal first path segment every match must
 // have, if the pattern fixes one (e.g. "blog" for /blog/:slug).
 func (p *compiledPattern) firstSegment() (string, bool) {
-	if len(p.head) < 2 || p.head[0].slot >= 0 || p.head[0].literal != "" || p.head[1].slot >= 0 {
+	if p.fold || len(p.head) < 2 || p.head[0].slot >= 0 || p.head[0].literal != "" || p.head[1].slot >= 0 {
 		return "", false
 	}
 	return p.head[1].literal, true
@@ -159,7 +170,7 @@ func (p *compiledPattern) walk(path string, values []string) (start, end int, ok
 			} else if strings.IndexByte(rest, '/') >= 0 {
 				return 0, 0, false
 			}
-			if !seg.match(part, values) {
+			if !seg.match(part, values) && !(p.fold && seg.matchFold(part)) {
 				return 0, 0, false
 			}
 		}
@@ -168,7 +179,7 @@ func (p *compiledPattern) walk(path string, values []string) (start, end int, ok
 
 	for _, seg := range p.head {
 		j := strings.IndexByte(rest, '/')
-		if j < 0 || !seg.match(rest[:j], values) {
+		if j < 0 || !seg.match(rest[:j], values) && !(p.fold && seg.matchFold(rest[:j])) {
 			return 0, 0, false
 		}
 		rest = rest[j+1:]
@@ -178,18 +189,96 @@ func (p *compiledPattern) walk(path string, values []string) (start, end int, ok
 	// Matching the tail only within what the head left keeps both apart.
 	for i := len(p.tail) - 1; i >= 0; i-- {
 		j := strings.LastIndexByte(rest, '/')
-		if j < 0 || !p.tail[i].match(rest[j+1:], values) {
+		if j < 0 || !p.tail[i].match(rest[j+1:], values) && !(p.fold && p.tail[i].matchFold(rest[j+1:])) {
 			return 0, 0, false
 		}
 		rest = rest[:j]
 	}
 	end = start + len(rest)
 
-	if len(rest) < len(p.before)+len(p.after) ||
-		!strings.HasPrefix(rest, p.before) || !strings.HasSuffix(rest, p.after) {
+	before, after := len(p.before), len(p.after)
+	ok = len(rest) >= before+after && strings.HasPrefix(rest, p.before) && strings.HasSuffix(rest, p.after)
+	if !ok && p.fold {
+		before, after, ok = foldAffixLens(rest, p.before, p.after)
+	}
+	if !ok {
 		return 0, 0, false
 	}
-	return start + len(p.before), end - len(p.after), true
+	return start + before, end - after, true
+}
+
+// foldAffixLens reports whether s starts with prefix and ends with suffix
+// regardless of case, without the two overlapping, and how many bytes of s
+// each covers.
+func foldAffixLens(s, prefix, suffix string) (before, after int, ok bool) {
+	before, okPrefix := foldPrefixLen(s, prefix)
+	after, okSuffix := foldSuffixLen(s, suffix)
+	return before, after, okPrefix && okSuffix && before+after <= len(s)
+}
+
+// foldRune maps r to one representative of the runes that case-insensitive
+// filesystems may treat as equal to it. Lowercasing the uppercase form
+// covers both how APFS folds case (K, U+212A Kelvin, is k) and how NTFS
+// upper-cases (ı, U+0131, is I); see isProtectedConfigPath. Where the two
+// differ it treats more runes as equal than either, so a rule rather
+// matches a file it needn't than misses one it should.
+func foldRune(r rune) rune {
+	if r < utf8.RuneSelf {
+		if 'A' <= r && r <= 'Z' {
+			r += 'a' - 'A'
+		}
+		return r
+	}
+	return unicode.ToLower(unicode.ToUpper(r))
+}
+
+// foldKey returns s with every rune folded, for looking up exact paths
+// regardless of case. strings.Map returns s itself when nothing changes, so
+// lowercase ASCII paths don't allocate.
+func foldKey(s string) string {
+	return strings.Map(foldRune, s)
+}
+
+// foldEqual reports whether a and b are equal regardless of case.
+func foldEqual(a, b string) bool {
+	n, ok := foldPrefixLen(a, b)
+	return ok && n == len(a)
+}
+
+// foldPrefixLen reports whether s starts with prefix regardless of case,
+// and how many bytes of s that takes: folding can pair runes of different
+// encoded lengths, such as K (3 bytes) and k.
+func foldPrefixLen(s, prefix string) (int, bool) {
+	i := 0
+	for _, want := range prefix {
+		if i == len(s) {
+			return 0, false
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if foldRune(r) != foldRune(want) {
+			return 0, false
+		}
+		i += size
+	}
+	return i, true
+}
+
+// foldSuffixLen is foldPrefixLen for the end of s.
+func foldSuffixLen(s, suffix string) (int, bool) {
+	i := len(s)
+	for j := len(suffix); j > 0; {
+		if i == 0 {
+			return 0, false
+		}
+		want, wantSize := utf8.DecodeLastRuneInString(suffix[:j])
+		r, size := utf8.DecodeLastRuneInString(s[:i])
+		if foldRune(r) != foldRune(want) {
+			return 0, false
+		}
+		i -= size
+		j -= wantSize
+	}
+	return len(s) - i, true
 }
 
 // splatSlot marks a template part that refers to :splat.
@@ -201,6 +290,7 @@ type templatePart struct {
 	literal string
 	slot    int
 	query   bool // reference lies in the query string of a URL template
+	host    bool // reference lies in the authority of an absolute URL template
 }
 
 // template is a header value or redirect destination whose :name and
@@ -237,8 +327,21 @@ func compileTemplate(raw string, p *compiledPattern) template {
 	// Link: </a?v=1>, </b/:slug> the query of one URL doesn't cover the
 	// next. Substituted values are escaped, so they can't start one.
 	inQuery, inFragment := false, false
+
+	// The authority of a template starting with an absolute URL ends at the
+	// first '/', '\' (which browsers read as '/'), '?' or '#'.
+	hostStart, inHost := -1, false
+	if strings.HasPrefix(raw, "https://") {
+		hostStart = len("https://")
+	} else if strings.HasPrefix(raw, "http://") {
+		hostStart = len("http://")
+	}
+
 	lit := 0
 	for i := 0; i < len(raw); {
+		if i == hostStart {
+			inHost = true
+		}
 		matched := false
 		if raw[i] == ':' {
 			for _, tok := range tokens {
@@ -246,7 +349,7 @@ func compileTemplate(raw string, p *compiledPattern) template {
 					if lit < i {
 						t.parts = append(t.parts, templatePart{literal: raw[lit:i], slot: -1})
 					}
-					t.parts = append(t.parts, templatePart{slot: tok.slot, query: inQuery})
+					t.parts = append(t.parts, templatePart{slot: tok.slot, query: inQuery, host: inHost})
 					i += len(tok.text)
 					lit = i
 					matched = true
@@ -258,12 +361,14 @@ func compileTemplate(raw string, p *compiledPattern) template {
 			continue
 		}
 		switch raw[i] {
+		case '/', '\\':
+			inHost = false
 		case '?':
-			inQuery = !inFragment
+			inQuery, inHost = !inFragment, false
 		case '#':
-			inQuery, inFragment = false, true
+			inQuery, inFragment, inHost = false, true, false
 		case ' ', '\t', '"', '<', '>':
-			inQuery, inFragment = false, false
+			inQuery, inFragment, inHost = false, false, false
 		}
 		i++
 	}
@@ -325,6 +430,29 @@ func (t template) expand(values []string, splat string) string {
 		}
 	}
 	return b.String()
+}
+
+// hostValuesValid reports whether every value the template puts into the
+// authority of an absolute URL is a host label: ASCII letters, digits and
+// hyphens. Escaping can't keep other values in place there, since browsers
+// percent-decode hosts (%2E becomes a dot), so a value such as .evil.com or
+// @evil.com could choose the host.
+func (t template) hostValuesValid(values []string, splat string) bool {
+	for _, part := range t.parts {
+		if !part.host {
+			continue
+		}
+		v := splat
+		if part.slot != splatSlot {
+			v = values[part.slot]
+		}
+		for i := 0; i < len(v); i++ {
+			if c := v[i]; !('a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // escapeSplat percent-encodes each segment of a splat value while keeping

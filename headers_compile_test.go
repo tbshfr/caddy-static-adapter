@@ -951,3 +951,38 @@ func TestHeaderQueryEscapingEndsWithURL(t *testing.T) {
 		t.Errorf("X-Urls: want %q, got %q", want, got)
 	}
 }
+
+func TestCompileFoldCase(t *testing.T) {
+	rules, _ := Parse(strings.NewReader(`/admin/*
+  X-Frame-Options: DENY
+/About
+  X-Page: about
+/blog/:slug
+  X-Slug: :slug
+`), 0, 0, 0)
+
+	tests := []struct{ path, header, want string }{
+		{"/ADMIN/x", "X-Frame-Options", "DENY"},
+		{"/about", "X-Page", "about"},
+		{"/ABOUT", "X-Page", "about"},
+		{"/Blog/Hello", "X-Slug", "Hello"},
+	}
+	folded := compileRules(rules, true)
+	for _, tt := range tests {
+		for _, dedup := range []bool{false, true} {
+			ops := folded.MatchOrdered(tt.path, "")
+			if dedup {
+				ops = folded.MatchBySpecificity(tt.path, "")
+			}
+			headers := make(http.Header)
+			applyHeaders(headers, ops, dedup)
+			if got := headers.Get(tt.header); got != tt.want {
+				t.Errorf("%s (dedup %v): %s: want %q, got %q", tt.path, dedup, tt.header, tt.want, got)
+			}
+		}
+	}
+
+	if ops := Compile(rules).MatchOrdered("/ADMIN/x", ""); len(ops) != 0 {
+		t.Errorf("expected case-sensitive rules not to match /ADMIN/x, got %v", ops)
+	}
+}

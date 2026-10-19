@@ -41,7 +41,10 @@ func BenchmarkRedirectsMatchExpand500(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		match := c.MatchFirst("/cat250/foo/bar")
-		if match == nil || match.expand("/cat250/foo/bar") != "/new250/foo/bar" {
+		if match == nil {
+			b.Fatal("expected a match")
+		}
+		if to, _ := match.expand("/cat250/foo/bar"); to != "/new250/foo/bar" {
 			b.Fatal("unexpected result")
 		}
 	}

@@ -150,6 +150,67 @@ func writeWithMtime(t *testing.T, file, content string, offset time.Duration) {
 	}
 }
 
+// replaceWithMtime is writeWithMtime through a rename, so that the file is
+// never seen empty or partly written.
+func replaceWithMtime(t *testing.T, file, content string, offset time.Duration) {
+	t.Helper()
+	tmp := file + ".tmp"
+	writeWithMtime(t, tmp, content, offset)
+	if err := os.Rename(tmp, file); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFileChangedWhileLoadingIsLoadedAgain(t *testing.T) {
+	file := filepath.Join(t.TempDir(), "_redirects")
+	writeWithMtime(t, file, "/x /v1 301\n", 0)
+
+	// refreshLocked is called directly, without getCached subscribing the
+	// directory, so no watcher reload interferes.
+	h := newTestRedirectHandler()
+	f := &cachedFile{}
+	refresh := func() string {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		h.refreshLocked(file, f, false)
+		if c, _ := f.get().(*CompiledRedirects); c != nil {
+			if match := c.MatchFirst("/x"); match != nil {
+				return match.To
+			}
+		}
+		return ""
+	}
+	load := h.loadFn
+	rewriteDuringLoad := func(content string, offset time.Duration) {
+		h.loadFn = func(p string) (any, error) {
+			h.loadFn = load
+			data, err := load(p)
+			writeWithMtime(t, p, content, offset)
+			return data, err
+		}
+	}
+
+	// Without previous rules, the rules read are used until the next check.
+	rewriteDuringLoad("/x /v2 301\n", time.Second)
+	if to := refresh(); to != "/v1" {
+		t.Fatalf("expected the rules read (/v1) on a first load the file changed during, got %q", to)
+	}
+	if to := refresh(); to != "/v2" {
+		t.Fatalf("expected the next check to load /v2, got %q", to)
+	}
+
+	// An in-place rewrite: the load reads the truncated file, and the
+	// rewrite finishes before the load returns.
+	writeWithMtime(t, file, "", 2*time.Second)
+	rewriteDuringLoad("/x /v3 301\n", 3*time.Second)
+	if to := refresh(); to != "/v2" {
+		t.Errorf("expected the previous rules (/v2) after a load the file changed during, got %q", to)
+	}
+	if to := refresh(); to != "/v3" {
+		t.Errorf("expected the next check to load /v3, got %q", to)
+	}
+}
+
 func TestStrictFailureKeepsPreviousRules(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "_redirects")
 	writeWithMtime(t, file, "/old /new 301\n", 0)
@@ -645,8 +706,10 @@ func TestGetCachedConcurrentWithReloads(t *testing.T) {
 		}()
 	}
 
+	// Written in place, the file could be read empty between truncation and
+	// write, which is a valid file without the rule.
 	for i := 1; i <= 20; i++ {
-		writeWithMtime(t, file, fmt.Sprintf("/x /v%d 301\n", i), time.Duration(i)*time.Second)
+		replaceWithMtime(t, file, fmt.Sprintf("/x /v%d 301\n", i), time.Duration(i)*time.Second)
 		h.expireCache()
 		h.reloadInBackground(file)
 		time.Sleep(5 * time.Millisecond)

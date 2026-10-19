@@ -37,7 +37,19 @@ func isProtectedConfigPath(requestPath, protectedPath string) bool {
 		return false
 	}
 
-	segments := strings.Split(strings.ReplaceAll(requestPath, `\`, "/"), "/")
+	cleaned := pathpkg.Clean(windowsPath(requestPath))
+	// Filesystems fold case differently: APFS folds K (U+212A, Kelvin) to k,
+	// which only EqualFold matches, while NTFS upper-cases ı (U+0131) to I,
+	// which only ToUpper matches.
+	return strings.EqualFold(cleaned, protectedPath) ||
+		strings.ToUpper(cleaned) == strings.ToUpper(protectedPath)
+}
+
+// windowsPath rewrites p the way Windows resolves a path: backslashes
+// separate segments too, and trailing dots and spaces of a segment are
+// ignored. Dot segments are left for path.Clean.
+func windowsPath(p string) string {
+	segments := strings.Split(strings.ReplaceAll(p, `\`, "/"), "/")
 	for i, s := range segments {
 		if t := strings.TrimRight(s, " "); t == "." || t == ".." {
 			segments[i] = t
@@ -45,13 +57,7 @@ func isProtectedConfigPath(requestPath, protectedPath string) bool {
 		}
 		segments[i] = strings.TrimRight(s, ". ")
 	}
-
-	cleaned := pathpkg.Clean(strings.Join(segments, "/"))
-	// Filesystems fold case differently: APFS folds K (U+212A, Kelvin) to k,
-	// which only EqualFold matches, while NTFS upper-cases ı (U+0131) to I,
-	// which only ToUpper matches.
-	return strings.EqualFold(cleaned, protectedPath) ||
-		strings.ToUpper(cleaned) == strings.ToUpper(protectedPath)
+	return strings.Join(segments, "/")
 }
 
 func isASCII(s string) bool {

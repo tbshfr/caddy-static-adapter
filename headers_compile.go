@@ -62,7 +62,10 @@ type indexedRule struct {
 // placeholder rules are kept in a separate slice. Both preserve original
 // definition order for deterministic, Cloudflare-compatible header application.
 type Compiled struct {
-	// exactPaths maps normalized path → indexed rules with that exact path.
+	// foldCase makes patterns match regardless of case (see foldRune).
+	foldCase bool
+	// exactPaths maps normalized path (as returned by key) → indexed rules
+	// with that exact path.
 	exactPaths map[string][]indexedRule
 	// wildcards holds rules containing * or : patterns in definition order.
 	wildcards []indexedRule
@@ -72,14 +75,22 @@ type Compiled struct {
 }
 
 // Compile takes parsed rules and compiles them into a Compiled structure
-// for efficient matching.
+// for efficient matching. Patterns match case-sensitively.
 func Compile(rules []*Rule) *Compiled {
+	return compileRules(rules, false)
+}
+
+// compileRules is Compile, with patterns matching regardless of case when
+// foldCase is set, for sites served from a case-insensitive filesystem.
+func compileRules(rules []*Rule, foldCase bool) *Compiled {
 	c := &Compiled{
+		foldCase:   foldCase,
 		exactPaths: make(map[string][]indexedRule, len(rules)),
 	}
 
 	for i, rule := range rules {
 		p := compilePattern(extractPath(rule.Pattern))
+		p.fold = foldCase
 		ops := compileOps(rule.Ops, p)
 		cr := &compiledRule{
 			Rule:    rule,
@@ -97,7 +108,8 @@ func Compile(rules []*Rule) *Compiled {
 		ir := indexedRule{index: i, cr: cr}
 
 		if p.exact() {
-			c.exactPaths[p.raw] = append(c.exactPaths[p.raw], ir)
+			key := c.key(p.raw)
+			c.exactPaths[key] = append(c.exactPaths[key], ir)
 		} else {
 			c.wildcards = append(c.wildcards, ir)
 		}
@@ -111,6 +123,14 @@ func Compile(rules []*Rule) *Compiled {
 	return c
 }
 
+// key returns the exactPaths key for path.
+func (c *Compiled) key(path string) string {
+	if c.foldCase {
+		return foldKey(path)
+	}
+	return path
+}
+
 // MatchOrdered returns all header operations preserving original rule definition
 // order across both exact and wildcard matches, matching Cloudflare semantics.
 // The host parameter should be the request's Host header (without port).
@@ -118,7 +138,7 @@ func Compile(rules []*Rule) *Compiled {
 func (c *Compiled) MatchOrdered(requestPath, requestHost string) []HeaderOp {
 	requestPath = normalizePath(requestPath)
 
-	exactRules := c.exactPaths[requestPath]
+	exactRules := c.exactPaths[c.key(requestPath)]
 
 	// Fast path: no wildcards — only exact matches to check.
 	if len(c.wildcards) == 0 {
@@ -179,7 +199,7 @@ func (c *Compiled) MatchBySpecificity(requestPath, requestHost string) []HeaderO
 			ops = append(ops, expandOps(ir.cr, ir.cr.dedupOps, requestPath)...)
 		}
 	}
-	for _, ir := range c.exactPaths[requestPath] {
+	for _, ir := range c.exactPaths[c.key(requestPath)] {
 		if ir.cr.host != "" && !matchHost(ir.cr.host, requestHost) {
 			continue
 		}

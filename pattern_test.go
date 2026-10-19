@@ -1,6 +1,7 @@
 package staticadapter
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -273,6 +274,41 @@ func TestPatternMatchAgreesWithCapture(t *testing.T) {
 			if got := p.match(path); got != ok {
 				t.Errorf("pattern %q path %q: match = %v, capture ok = %v", pattern, path, got, ok)
 			}
+		}
+	}
+}
+
+func TestPatternFoldCase(t *testing.T) {
+	tests := []struct {
+		pattern, path string
+		ok            bool
+		splat         string
+		values        []string
+	}{
+		{"/admin/*", "/ADMIN/x", true, "x", nil},
+		{"/admin/*", "/Admin/Secret", true, "Secret", nil}, // captured values keep their case
+		{"/blog/:slug", "/BLOG/Hello", true, "", []string{"Hello"}},
+		{"/img-*.jpg", "/IMG-Cat.JPG", true, "Cat", nil},
+		{"/about", "/ABOUT", true, "", nil},
+		{"/kit/*", "/Kit/x", true, "x", nil}, // Kelvin sign, which APFS folds to k
+		{"/is/*", "/ıS/x", true, "x", nil},   // dotless ı, which NTFS upper-cases to I
+		{"/s*k", "/ſabK", true, "ab", nil},
+		{"/ab*ba", "/ABA", false, "", nil}, // prefix and suffix must not overlap
+		{"/admin/*", "/admins/x", false, "", nil},
+		{"/café/*", "/CAFÉ/x", true, "x", nil},
+	}
+	for _, tt := range tests {
+		p := compilePattern(tt.pattern)
+		p.fold = true
+		values, splat, ok := p.capture(tt.path)
+		if ok != tt.ok || splat != tt.splat || !slices.Equal(values, tt.values) {
+			t.Errorf("fold capture(%q, %q) = %q, %q, %v, want %q, %q, %v", tt.pattern, tt.path, values, splat, ok, tt.values, tt.splat, tt.ok)
+		}
+		if got := p.match(tt.path); got != tt.ok {
+			t.Errorf("fold match(%q, %q) = %v, want %v", tt.pattern, tt.path, got, tt.ok)
+		}
+		if compilePattern(tt.pattern).match(tt.path) {
+			t.Errorf("match(%q, %q) without folding: expected no match", tt.pattern, tt.path)
 		}
 	}
 }

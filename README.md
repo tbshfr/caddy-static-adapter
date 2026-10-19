@@ -70,7 +70,7 @@ Each block starts with an unindented URL pattern, followed by indented header li
 - `:name` placeholders match a single path segment. Use `:name` in values to expand them. They can be combined with `*` in other segments, e.g. `/:lang/docs/*`.
 - Expanded values are percent-encoded as in a URL path (or query, after a `?`), so a request can't add cookie attributes or list items to a header.
 - Patterns starting with `https://` match against both host and path. Host labels can be placeholders, e.g. `https://:sub.example.com/*`.
-- Patterns match the path `file_server` serves, with dot segments resolved and repeated slashes merged, so `//admin/x` gets the headers of `/admin/*`.
+- Patterns match the path `file_server` serves, with dot segments resolved and repeated slashes merged, so `//admin/x` gets the headers of `/admin/*`. If the site root is on a case-insensitive filesystem (the default on macOS and Windows), patterns match regardless of case, since `/ADMIN/x` is the same file. On Windows, `\` also separates segments, and trailing dots and spaces in a segment are ignored, as Windows does.
 - All matching rules are applied, in file order.
 
 ### Limits
@@ -105,7 +105,7 @@ Place a `_redirects` file in your site root:
 Each line is `/from /to [status]`:
 
 - **Source** must start with `/`. Supports `*` and `:name`, also combined in separate segments (e.g. `/:lang/docs/*`).
-- **Destination** must start with `/` or be an absolute URL (`https://` or `http://`).
+- **Destination** must start with `/` or be an absolute URL (`https://` or `http://`). A placeholder in the host of an absolute destination, e.g. `https://:sub.example.com/`, must expand to a single host label (letters, digits and hyphens); otherwise the request isn't redirected.
 - **Status** is optional, defaults to 302. Supported: 301, 302, 303, 307, 308.
 - `#` lines are comments.
 - **First match wins** — unlike `_headers` where all matches apply, redirects stop at the first match.

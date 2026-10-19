@@ -217,10 +217,10 @@ func evictBefore(a, b *cachedFile) bool {
 // last successful load, or unconditionally when force is set. Must be
 // called with fh.mu held.
 //
-// A failed load keeps the previously loaded rules, so a broken deploy does
-// not silently strip headers such as a CSP. Failures are retried on every
-// check (fixing permissions doesn't change the mtime), but each distinct
-// error is logged only once.
+// A failed load, or one the file changed during, keeps the previously
+// loaded rules, so a broken deploy does not silently strip headers such as
+// a CSP. Failures are retried on every check (fixing permissions doesn't
+// change the mtime), but each distinct error is logged only once.
 func (fh *fileHandler) refreshLocked(filePath string, f *cachedFile, force bool) {
 	info, err := statIdentity(filePath)
 	if os.IsNotExist(err) {
@@ -240,6 +240,21 @@ func (fh *fileHandler) refreshLocked(filePath string, f *cachedFile, force bool)
 	data, err := fh.loadFn(filePath)
 	if err != nil {
 		fh.logLoadErrorLocked(filePath, f, err)
+		return
+	}
+	// A file rewritten in place (cp over it, an editor saving) is empty or
+	// partly written for a moment. If it changed while being read, the
+	// rules may be from such a state, so the previous ones stay active and
+	// the change's watcher event, or the next check, loads it again. With
+	// no previous rules, the rules read are still better than none.
+	if after, err := statIdentity(filePath); err != nil || fileChanged(info, after) {
+		fh.logger.Info(fh.logPrefix+": file changed while loading, loading it again on the next check",
+			zap.String("file", filePath),
+			zap.Bool("keeping_previous_rules", f.get() != nil))
+		if f.get() == nil {
+			f.set(data)
+			f.lastErr = ""
+		}
 		return
 	}
 	f.set(data)

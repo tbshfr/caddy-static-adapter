@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -478,6 +479,108 @@ func TestServeHTTPMatchesCleanedPath(t *testing.T) {
 
 	// file_server serves /admin/x for all of these.
 	for _, path := range []string{"/admin/x", "//admin/x", "/./admin/x", "/a/../admin/x", "/admin/./x"} {
+		req := httptest.NewRequest("GET", path, nil)
+		repl := caddy.NewReplacer()
+		repl.Set("http.vars.root", dir)
+		req = req.WithContext(context.WithValue(req.Context(), caddy.ReplacerCtxKey, repl))
+		rec := httptest.NewRecorder()
+		if err := h.ServeHTTP(rec, req, next); err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		if got := rec.Header().Get("X-Frame-Options"); got != "DENY" {
+			t.Errorf("%s: expected X-Frame-Options DENY, got %q", path, got)
+		}
+	}
+}
+
+func TestCleanRequestPathWindows(t *testing.T) {
+	defer func(v bool) { windowsPaths = v }(windowsPaths)
+	windowsPaths = true
+
+	tests := []struct{ path, want string }{
+		{`/admin\x`, "/admin/x"},
+		{`/a\..\admin\x`, "/admin/x"},
+		{"/admin./x", "/admin/x"},
+		{"/admin /x", "/admin/x"},
+		{"/admin/x. .", "/admin/x"},
+		{"/admin/x./", "/admin/x/"},
+		{"/admin/x.html", "/admin/x.html"},
+		{"/admin/../x", "/x"},
+	}
+	for _, tt := range tests {
+		if got := cleanRequestPath(tt.path); got != tt.want {
+			t.Errorf("cleanRequestPath(%q) on Windows = %q, want %q", tt.path, got, tt.want)
+		}
+	}
+
+	// Elsewhere a backslash or a trailing dot is part of the file name.
+	windowsPaths = false
+	for _, path := range []string{`/admin\x`, "/admin./x"} {
+		if got := cleanRequestPath(path); got != path {
+			t.Errorf("cleanRequestPath(%q) = %q, want it unchanged", path, got)
+		}
+	}
+}
+
+// linkUpperCase makes name in dir also reachable as its upper-case name,
+// as a case-insensitive filesystem would, unless dir already is one.
+func linkUpperCase(t *testing.T, dir, name string) {
+	t.Helper()
+	upper := filepath.Join(dir, strings.ToUpper(name))
+	if _, err := os.Stat(upper); err == nil {
+		return
+	}
+	if err := os.Link(filepath.Join(dir, name), upper); err != nil {
+		t.Skipf("hard links not supported here: %v", err)
+	}
+}
+
+func TestCaseInsensitiveDir(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "_headers")
+	if err := os.WriteFile(file, []byte("/x\n  X-A: 1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = os.Stat(filepath.Join(dir, "_HEADERS"))
+	if got, want := caseInsensitiveDir(file, info), err == nil; got != want {
+		t.Fatalf("caseInsensitiveDir = %v, want %v", got, want)
+	}
+	if err == nil {
+		return // the rest needs a case-sensitive filesystem
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "_HEADERS"), []byte("other"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if caseInsensitiveDir(file, info) {
+		t.Error("expected a different file named _HEADERS not to count")
+	}
+	if err := os.Remove(filepath.Join(dir, "_HEADERS")); err != nil {
+		t.Fatal(err)
+	}
+	linkUpperCase(t, dir, "_headers")
+	if !caseInsensitiveDir(file, info) {
+		t.Error("expected _HEADERS leading to the same file to count")
+	}
+}
+
+func TestServeHTTPMatchesAnyCaseOnCaseInsensitiveFS(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "_headers"), []byte("/admin/*\n  X-Frame-Options: DENY\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	linkUpperCase(t, dir, "_headers")
+
+	h := newTestHeadersHandler()
+	defer h.Cleanup()
+	next := caddyhttp.HandlerFunc(func(http.ResponseWriter, *http.Request) error { return nil })
+
+	// A case-insensitive filesystem serves /admin/x for all of these.
+	for _, path := range []string{"/admin/x", "/ADMIN/x", "/Admin/x", "//ADMIN/x"} {
 		req := httptest.NewRequest("GET", path, nil)
 		repl := caddy.NewReplacer()
 		repl.Set("http.vars.root", dir)

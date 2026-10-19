@@ -42,19 +42,24 @@ func newCompiledRedirect(r *RedirectRule) *compiledRedirect {
 }
 
 // expand returns the redirect destination for requestPath, which must match
-// the rule.
+// the rule. It returns false when no destination is safe to send: when a
+// value would go into the host of an absolute destination but isn't a host
+// label (see template.hostValuesValid).
 //
 // requestPath is the decoded r.URL.Path, so expanded values are re-escaped
 // before insertion. Otherwise a request like /go/%5Cevil.com or /to/evil.com%23
 // would put a literal \ or # into the Location header and send the client to
 // another host.
-func (cr *compiledRedirect) expand(requestPath string) string {
+func (cr *compiledRedirect) expand(requestPath string) (string, bool) {
 	if !cr.to.dynamic() {
-		return cr.To
+		return cr.To, true
 	}
 	values, splat, ok := cr.pattern.capture(requestPath)
 	if !ok {
-		return cr.To
+		return cr.To, true
+	}
+	if !cr.to.hostValuesValid(values, splat) {
+		return "", false
 	}
 	to := cr.to.expand(values, splat)
 
@@ -65,7 +70,7 @@ func (cr *compiledRedirect) expand(requestPath string) string {
 	if strings.HasPrefix(to, "//") && !strings.HasPrefix(cr.To, "//") {
 		to = "/" + strings.TrimLeft(to, "/")
 	}
-	return to
+	return to, true
 }
 
 // indexedRedirect pairs a compiledRedirect with its original file position.
@@ -211,9 +216,10 @@ func (h *RedirectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request, next
 	compiled := h.getCompiledRedirects(filePath)
 	if compiled != nil {
 		if match := compiled.MatchFirst(r.URL.Path); match != nil {
-			to := match.expand(normalizePath(r.URL.Path))
-			http.Redirect(w, r, to, match.Status)
-			return nil
+			if to, ok := match.expand(normalizePath(r.URL.Path)); ok {
+				http.Redirect(w, r, to, match.Status)
+				return nil
+			}
 		}
 	}
 

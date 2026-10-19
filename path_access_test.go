@@ -23,6 +23,17 @@ func TestIsProtectedConfigPath(t *testing.T) {
 		{name: "nested config file", requestPath: "/assets/_headers", protectedPath: "/_headers", want: false},
 		{name: "file extension dot", requestPath: "/site.css", protectedPath: "/_headers", want: false},
 		{name: "similar substring", requestPath: "/_headers-backup", protectedPath: "/_headers", want: false},
+		{name: "nested config file uppercase", requestPath: "/assets/_HEADERS", protectedPath: "/_headers", want: false},
+		{name: "uppercase", requestPath: "/_HEADERS", protectedPath: "/_headers", want: true},
+		{name: "mixed case redirects", requestPath: "/_Redirects", protectedPath: "/_redirects", want: true},
+		{name: "uppercase traversal", requestPath: "/foo/../_Headers/", protectedPath: "/_headers", want: true},
+		{name: "trailing dot", requestPath: "/_headers.", protectedPath: "/_headers", want: true},
+		{name: "trailing dots and spaces", requestPath: "/_headers. .", protectedPath: "/_headers", want: true},
+		{name: "trailing space", requestPath: "/_redirects ", protectedPath: "/_redirects", want: true},
+		{name: "backslash separator", requestPath: `/\_headers`, protectedPath: "/_headers", want: true},
+		{name: "backslash traversal", requestPath: `/foo\..\_headers`, protectedPath: "/_headers", want: true},
+		{name: "dot-dot with trailing space", requestPath: "/foo/.. /_headers", protectedPath: "/_headers", want: true},
+		{name: "file extension after name", requestPath: "/_headers.txt", protectedPath: "/_headers", want: false},
 	}
 
 	for _, tt := range tests {

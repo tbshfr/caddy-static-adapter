@@ -414,6 +414,8 @@ func TestServeHTTPBlocks_headers(t *testing.T) {
 		{"/_headers/", true},            // trailing slash normalization
 		{"/./_headers", true},           // dot segment normalization
 		{"/_headers/.", true},           // terminal dot segment
+		{"/_HEADERS", true},             // case-insensitive filesystems
+		{"/_headers.", true},            // Windows ignores trailing dots
 		{"/page", false},
 		{"/_redirects", false}, // not this handler's concern
 		{"/", false},

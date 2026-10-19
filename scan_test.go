@@ -35,6 +35,24 @@ func TestParseHeadersVeryLongLineDoesNotDropRest(t *testing.T) {
 	}
 }
 
+func TestParseHeadersVeryLongPatternDoesNotLeakHeaders(t *testing.T) {
+	input := "/a\n  X-A: kept\n/" + strings.Repeat("b", 10*HeaderMaxLineLength) + "\n  X-B: dropped\n/c\n  X-C: kept\n"
+	rules, warnings := Parse(strings.NewReader(input), 0, 0, 0)
+
+	if len(rules) != 2 || rules[0].Pattern != "/a" || rules[1].Pattern != "/c" {
+		t.Fatalf("expected rules /a and /c around the long line, got %d rules", len(rules))
+	}
+	if len(rules[0].Ops) != 1 || rules[0].Ops[0].Name != "X-A" {
+		t.Errorf("skipped rule's headers leaked into /a: %+v", rules[0].Ops)
+	}
+	if len(rules[1].Ops) != 1 || rules[1].Ops[0].Name != "X-C" {
+		t.Errorf("expected X-C on /c, got %+v", rules[1].Ops)
+	}
+	if len(warnings) != 2 || !strings.Contains(warnings[0].Error(), "line 3: line exceeds maximum length") {
+		t.Fatalf("expected a line-length warning for line 3 and one for its header line, got %v", warnings)
+	}
+}
+
 func TestScanLinesFileSizeBoundary(t *testing.T) {
 	collect := func(input string, maxFileSize int) ([]string, []error) {
 		var lines []string
@@ -42,7 +60,7 @@ func TestScanLinesFileSizeBoundary(t *testing.T) {
 		scanLines(strings.NewReader(input), maxFileSize, 100, &warnings, func(_ int, line string) bool {
 			lines = append(lines, line)
 			return false
-		})
+		}, nil)
 		return lines, warnings
 	}
 
@@ -71,7 +89,7 @@ func TestScanLinesCRLF(t *testing.T) {
 	scanLines(strings.NewReader("/a /x\r\n12345\r\n/c /z"), 1000, 5, &warnings, func(_ int, line string) bool {
 		lines = append(lines, line)
 		return false
-	})
+	}, nil)
 
 	want := []string{"/a /x", "12345", "/c /z"}
 	if strings.Join(lines, "|") != strings.Join(want, "|") {

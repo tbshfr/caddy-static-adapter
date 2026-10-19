@@ -81,7 +81,7 @@ func ParseRedirects(r io.Reader, maxRules, maxFileSize, maxLineLength int) ([]*R
 
 		rules = append(rules, rule)
 		return false
-	})
+	}, nil)
 
 	return rules, warnings
 }

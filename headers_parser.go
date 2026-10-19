@@ -75,10 +75,7 @@ func Parse(r io.Reader, maxRules, maxFileSize, maxLineLength int) ([]*Rule, []er
 			return false
 		}
 
-		// Determine if this is a header line (indented) or a URL pattern line.
-		isIndented := len(line) > 0 && (line[0] == ' ' || line[0] == '\t')
-
-		if isIndented {
+		if isIndented(line) {
 			if current == nil {
 				warnings = append(warnings, &ParseError{Line: lineNum, Message: "header line without preceding URL pattern"})
 				return false
@@ -98,6 +95,9 @@ func Parse(r io.Reader, maxRules, maxFileSize, maxLineLength int) ([]*Rule, []er
 
 		if err := validatePattern(pattern, lineNum); err != nil {
 			warnings = append(warnings, err)
+			// Otherwise the rejected rule's headers would be added to the
+			// previous rule.
+			current = nil
 			return false
 		}
 
@@ -112,9 +112,21 @@ func Parse(r io.Reader, maxRules, maxFileSize, maxLineLength int) ([]*Rule, []er
 		}
 		rules = append(rules, current)
 		return false
+	}, func(line string) {
+		// An overlong header line only drops that header, an overlong
+		// pattern line its whole rule.
+		if !isIndented(line) {
+			current = nil
+		}
 	})
 
 	return rules, warnings
+}
+
+// isIndented reports whether line is a header line rather than a URL
+// pattern line.
+func isIndented(line string) bool {
+	return len(line) > 0 && (line[0] == ' ' || line[0] == '\t')
 }
 
 // parseHeaderLine parses a single header line like "Header-Name: value" or "! Header-Name".

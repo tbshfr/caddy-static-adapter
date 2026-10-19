@@ -369,3 +369,26 @@ func TestHeaderValueWithColons(t *testing.T) {
 		t.Errorf("unexpected value: %s", rules[0].Ops[0].Value)
 	}
 }
+
+func TestParseRejectedPatternDoesNotLeakHeaders(t *testing.T) {
+	input := `/admin/*
+  X-Frame-Options: DENY
+/a/:x*
+  ! Content-Security-Policy
+/b
+  X-B: kept
+`
+	rules, warnings := Parse(strings.NewReader(input), 0, 0, 0)
+	if len(rules) != 2 || rules[0].Pattern != "/admin/*" || rules[1].Pattern != "/b" {
+		t.Fatalf("expected rules /admin/* and /b, got %+v", rules)
+	}
+	if len(rules[0].Ops) != 1 || rules[0].Ops[0].Name != "X-Frame-Options" {
+		t.Errorf("rejected rule's headers leaked into /admin/*: %+v", rules[0].Ops)
+	}
+	if len(rules[1].Ops) != 1 || rules[1].Ops[0].Name != "X-B" {
+		t.Errorf("expected X-B on /b, got %+v", rules[1].Ops)
+	}
+	if len(warnings) != 2 {
+		t.Errorf("expected warnings for the pattern and its header line, got %v", warnings)
+	}
+}

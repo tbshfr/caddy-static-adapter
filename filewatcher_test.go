@@ -569,3 +569,53 @@ func TestGetCachedConcurrentWithReloads(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+func TestCheckOfEvictedEntryDoesNotResubscribe(t *testing.T) {
+	base := t.TempDir()
+	file := func(i int) string {
+		dir := filepath.Join(base, fmt.Sprint(i))
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		return filepath.Join(dir, "_redirects")
+	}
+
+	h := newTestRedirectHandler()
+	victim := file(0)
+	h.getCached(victim)
+	for i := 1; i < maxCachedFiles; i++ {
+		h.getCached(file(i))
+	}
+	if !h.hasWatcher() {
+		h.Cleanup()
+		t.Skip("fsnotify watcher not available on this platform; skipping watcher test")
+	}
+	f := h.lookup(victim)
+	f.lastCheck.Store(0)
+
+	// Hold mu so the request below wins the check but waits before running it.
+	h.mu.Lock()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		h.getCached(victim)
+	}()
+	for f.lastCheck.Load() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+
+	// Evict the entry while the check waits, as if many other roots were
+	// added in the meantime.
+	f.lastCheck.Store(0)
+	h.addFileLocked(file(maxCachedFiles), &cachedFile{})
+	h.mu.Unlock()
+	<-done
+
+	if h.lookup(victim) != nil {
+		t.Fatal("expected the victim to be evicted")
+	}
+	h.Cleanup()
+	if n := hubHandlers(filepath.Dir(victim)); n != 0 {
+		t.Errorf("expected no watch on the evicted root after Cleanup, got %d handlers", n)
+	}
+}

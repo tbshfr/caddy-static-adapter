@@ -10,13 +10,15 @@ import (
 // scanLines reads r line by line, enforcing the file size and line length
 // limits shared by the _headers and _redirects parsers, and calls fn for
 // every line within them. Limit violations are appended to warnings in line
-// order. fn returns true to stop scanning.
+// order. fn returns true to stop scanning. Overlong lines are passed to
+// skipped instead, if it is non-nil, so a parser can drop state tied to
+// them.
 //
 // bufio.Scanner is not used because it aborts the whole scan when a line
 // exceeds its buffer, silently dropping all following rules; here an
 // overlong line is skipped like any other invalid line. Memory stays bounded
 // because at most maxFileSize+1 bytes are ever read.
-func scanLines(r io.Reader, maxFileSize, maxLineLength int, warnings *[]error, fn func(lineNum int, line string) bool) {
+func scanLines(r io.Reader, maxFileSize, maxLineLength int, warnings *[]error, fn func(lineNum int, line string) bool, skipped func(line string)) {
 	br := bufio.NewReader(io.LimitReader(r, int64(maxFileSize)+1))
 	lineNum := 0
 	totalBytes := 0
@@ -40,6 +42,9 @@ func scanLines(r io.Reader, maxFileSize, maxLineLength int, warnings *[]error, f
 		line := strings.TrimSuffix(strings.TrimSuffix(raw, "\n"), "\r")
 		if len(line) > maxLineLength {
 			*warnings = append(*warnings, &ParseError{Line: lineNum, Message: fmt.Sprintf("line exceeds maximum length of %d characters", maxLineLength)})
+			if skipped != nil {
+				skipped(line)
+			}
 		} else if fn(lineNum, line) {
 			return
 		}

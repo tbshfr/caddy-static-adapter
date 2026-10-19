@@ -60,8 +60,9 @@ func (f *cachedFile) set(data any) {
 // Both the headers and redirects handlers embed this type to avoid
 // duplicating the polling / fsnotify / caching logic.
 type fileHandler struct {
-	// Strict controls whether parse errors cause the handler to
-	// discard all rules. When false (default), parse warnings are
+	// Strict controls whether parse errors reject the whole file. A
+	// rejected file keeps the previously loaded rules active until a
+	// valid version is loaded. When false (default), parse warnings are
 	// logged but valid rules still apply.
 	Strict bool `json:"strict,omitempty"`
 
@@ -121,8 +122,13 @@ func (fh *fileHandler) getCached(filePath string) any {
 		last := f.lastCheck.Load()
 		if now-last >= int64(checkInterval) && f.lastCheck.CompareAndSwap(last, now) {
 			fh.mu.Lock()
-			fh.ensureWatchingLocked(filePath, f)
-			fh.refreshLocked(filePath, f, false)
+			// The entry may have been evicted while this request waited.
+			// Subscribing it again would leave a watch that Cleanup can't
+			// find, keeping this handler alive in sharedWatcher.
+			if fh.lookup(filePath) == f {
+				fh.ensureWatchingLocked(filePath, f)
+				fh.refreshLocked(filePath, f, false)
+			}
 			fh.mu.Unlock()
 		}
 		return f.get()

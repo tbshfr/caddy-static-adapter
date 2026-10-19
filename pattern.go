@@ -270,6 +270,26 @@ func compileTemplate(raw string, p *compiledPattern) template {
 	return t
 }
 
+// join returns t followed by sep and u, each keeping the escaping it was
+// compiled with.
+func (t template) join(sep string, u template) template {
+	j := template{raw: t.raw + sep + u.raw}
+	if t.parts == nil && u.parts == nil {
+		return j
+	}
+	j.parts = append(j.parts, t.partsOrLiteral()...)
+	j.parts = append(j.parts, templatePart{literal: sep, slot: -1})
+	j.parts = append(j.parts, u.partsOrLiteral()...)
+	return j
+}
+
+func (t template) partsOrLiteral() []templatePart {
+	if t.parts == nil {
+		return []templatePart{{literal: t.raw, slot: -1}}
+	}
+	return t.parts
+}
+
 // dynamic reports whether the template references the pattern.
 func (t template) dynamic() bool {
 	return t.parts != nil

@@ -487,6 +487,85 @@ func TestSharedWatcherAcrossHandlers(t *testing.T) {
 	}
 }
 
+// TestWatcherSharedDirectoryViaSymlink covers two roots that are the same
+// directory. inotify gives both paths one watch, which fsnotify knows by the
+// first path only, so events must reach both and cleaning up either must
+// leave the other watched.
+func TestWatcherSharedDirectoryViaSymlink(t *testing.T) {
+	for _, cleanupFirst := range []bool{true, false} {
+		t.Run(fmt.Sprintf("cleanup first subscriber %v", cleanupFirst), func(t *testing.T) {
+			base := t.TempDir()
+			real := filepath.Join(base, "real")
+			link := filepath.Join(base, "link")
+			if err := os.Mkdir(real, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(real, link); err != nil {
+				t.Skip("symlinks not supported:", err)
+			}
+			if err := os.WriteFile(filepath.Join(real, "_headers"), []byte("/x\n  X-V: 1\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			realFile, linkFile := filepath.Join(real, "_headers"), filepath.Join(link, "_headers")
+			first, second := newTestHeadersHandler(), newTestHeadersHandler()
+			defer first.Cleanup()
+			defer second.Cleanup()
+			first.getCompiled(realFile)
+			second.getCompiled(linkFile)
+			if !first.hasWatcher() || !second.hasWatcher() {
+				t.Skip("fsnotify watcher not available on this platform; skipping watcher test")
+			}
+
+			value := func(h *Handler, file string) string {
+				c, _ := h.cachedData(file).(*Compiled)
+				if c == nil {
+					return ""
+				}
+				ops := c.MatchOrdered("/x", "")
+				if len(ops) != 1 {
+					return ""
+				}
+				return ops[0].Value
+			}
+			// cachedData never polls, and the deadline is below checkInterval,
+			// so only watcher events can satisfy these.
+			waitFor := func(what string, cond func() bool) {
+				t.Helper()
+				deadline := time.Now().Add(checkInterval / 2)
+				for time.Now().Before(deadline) {
+					if cond() {
+						return
+					}
+					time.Sleep(20 * time.Millisecond)
+				}
+				t.Fatalf("timed out waiting for %s", what)
+			}
+
+			if err := os.WriteFile(realFile, []byte("/x\n  X-V: 2\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			waitFor("reload via real path", func() bool { return value(first, realFile) == "2" })
+			waitFor("reload via symlink", func() bool { return value(second, linkFile) == "2" })
+
+			gone, remaining, remainingFile := first, second, linkFile
+			if !cleanupFirst {
+				gone, remaining, remainingFile = second, first, realFile
+			}
+			gone.Cleanup()
+			if err := os.WriteFile(realFile, []byte("/x\n  X-V: 3\n"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			waitFor("reload after the other handler's cleanup", func() bool { return value(remaining, remainingFile) == "3" })
+
+			remaining.Cleanup()
+			if n := hubHandlers(real) + hubHandlers(link); n != 0 {
+				t.Fatalf("expected no subscriptions after all cleanups, got %d handlers", n)
+			}
+		})
+	}
+}
+
 func TestDueCheckDoesNotBlockOtherRequests(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "_redirects")
 	writeWithMtime(t, file, "/x /v1 301\n", 0)

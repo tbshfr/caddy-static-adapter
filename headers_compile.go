@@ -80,12 +80,16 @@ func Compile(rules []*Rule) *Compiled {
 
 	for i, rule := range rules {
 		p := compilePattern(extractPath(rule.Pattern))
+		ops := compileOps(rule.Ops, p)
 		cr := &compiledRule{
-			Rule:     rule,
-			pattern:  p,
-			host:     extractHost(rule.Pattern),
-			ops:      compileOps(rule.Ops, p),
-			dedupOps: compileOps(mergeRepeatedHeaders(rule.Ops), p),
+			Rule:    rule,
+			pattern: p,
+			host:    extractHost(rule.Pattern),
+			ops:     ops,
+			// Merging compiled values rather than compiling merged ones
+			// keeps a '?' in one value from making placeholders in the
+			// values after it query-escaped.
+			dedupOps: ops.mergeRepeated(),
 		}
 		// Compute specificity for dedup ordering.
 		cr.specificity = computeSpecificity(p)
@@ -259,25 +263,44 @@ func expandOps(cr *compiledRule, ops compiledOps, path string) []HeaderOp {
 // Headers that must not be comma-joined keep one op per value, with every
 // value after the first turned into an append.
 func mergeRepeatedHeaders(ops []HeaderOp) []HeaderOp {
-	merged := make([]HeaderOp, 0, len(ops))
+	return compiledOps{ops: ops}.mergeRepeated().ops
+}
+
+// mergeRepeated is mergeRepeatedHeaders for compiled ops, joining the
+// compiled values along with the raw ones.
+func (c compiledOps) mergeRepeated() compiledOps {
+	merged := compiledOps{ops: make([]HeaderOp, 0, len(c.ops)), dynamic: c.dynamic}
+	if c.values != nil {
+		merged.values = make([]template, 0, len(c.ops))
+	}
+	add := func(op HeaderOp, i int) {
+		merged.ops = append(merged.ops, op)
+		if c.values != nil {
+			merged.values = append(merged.values, c.values[i])
+		}
+	}
+
 	current := make(map[string]int) // header name → index of its set in merged
-	for _, op := range ops {
+	for i, op := range c.ops {
 		if op.Mode == OpRemove {
 			delete(current, op.Name)
-			merged = append(merged, op)
+			add(op, i)
 			continue
 		}
-		if i, ok := current[op.Name]; ok {
+		if j, ok := current[op.Name]; ok {
 			if noCommaJoin(op.Name) {
 				op.Mode = opAppend
-				merged = append(merged, op)
+				add(op, i)
 				continue
 			}
-			merged[i].Value += ", " + op.Value
+			merged.ops[j].Value += ", " + op.Value
+			if c.values != nil {
+				merged.values[j] = merged.values[j].join(", ", c.values[i])
+			}
 			continue
 		}
-		current[op.Name] = len(merged)
-		merged = append(merged, op)
+		current[op.Name] = len(merged.ops)
+		add(op, i)
 	}
 	return merged
 }

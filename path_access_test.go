@@ -34,6 +34,12 @@ func TestIsProtectedConfigPath(t *testing.T) {
 		{name: "backslash traversal", requestPath: `/foo\..\_headers`, protectedPath: "/_headers", want: true},
 		{name: "dot-dot with trailing space", requestPath: "/foo/.. /_headers", protectedPath: "/_headers", want: true},
 		{name: "file extension after name", requestPath: "/_headers.txt", protectedPath: "/_headers", want: false},
+		{name: "long s", requestPath: "/_headerſ", protectedPath: "/_headers", want: true},
+		{name: "long s redirects", requestPath: "/_redirectſ", protectedPath: "/_redirects", want: true},
+		{name: "dotless i", requestPath: "/_redırects", protectedPath: "/_redirects", want: true},
+		{name: "long s traversal", requestPath: "/café/../_headerſ/", protectedPath: "/_headers", want: true},
+		{name: "unrelated non-ASCII page", requestPath: "/café/_menu", protectedPath: "/_headers", want: false},
+		{name: "non-ASCII lookalike", requestPath: "/_hëaders", protectedPath: "/_headers", want: false},
 	}
 
 	for _, tt := range tests {

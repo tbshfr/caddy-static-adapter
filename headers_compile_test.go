@@ -921,3 +921,15 @@ func TestHeaderValuesEscaped(t *testing.T) {
 		t.Errorf("X-Search: want %q, got %q", want, got)
 	}
 }
+
+func TestDedupMergedValuesKeepEscaping(t *testing.T) {
+	rules, _ := Parse(strings.NewReader("/u/:name\n  Link: </a?x=1>\n  Link: </p/:name>\n"), 0, 0, 0)
+	c := Compile(rules)
+
+	headers := make(http.Header)
+	applyHeaders(headers, c.MatchBySpecificity("/u/a b", ""), true)
+	// The '?' of the first value must not make :name in the second a query value.
+	if got, want := headers.Get("Link"), "</a?x=1>, </p/a%20b>"; got != want {
+		t.Errorf("want %q, got %q", want, got)
+	}
+}
